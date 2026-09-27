@@ -115,6 +115,34 @@
     font-size: 15px;
     padding: 2px 6px;
   }
+  .transfer .item + .item {
+    border-top: 1px solid rgba(0, 0, 0, 0.06);
+  }
+  .transfer .bar {
+    height: 4px;
+    margin: 2px 0 6px;
+    border-radius: 2px;
+    background: rgba(0, 0, 0, 0.1);
+    overflow: hidden;
+  }
+  .transfer .bar i {
+    display: block;
+    width: 0;
+    height: 100%;
+    background: #6750a4;
+    transition: width 0.2s;
+  }
+  .transfer .failed .state {
+    max-width: 65%;
+    color: #b3261e;
+    white-space: normal;
+  }
+  .transfer .failed .bar i {
+    background: #b3261e;
+  }
+  .transfer [hidden] {
+    display: none;
+  }
   .transfer button:disabled {
     opacity: 0.5;
   }
@@ -669,92 +697,251 @@
     const row = fileRows.get(progress.transferId);
     if (row) row.state.textContent = `${Math.round(progress.percentage)}%`;
   });
-  // Device files the app picked (⇪): fetched from the gateway and put on the
-  // remote clipboard, to be pasted with Ctrl+V in Windows.
+  // Device files the app picked (⇪): read from the app's gateway, then put on
+  // the remote clipboard. Windows reads them when they are pasted (Ctrl+V);
+  // the bar shows both phases with progress bars.
   const uploadsElement = document.getElementById('uploads');
-  const uploadRows = new Map();
-  const uploadStateByFile = new WeakMap();
-  const uploadBar = (titleText) => {
+  let upload = null;
+  let uploadHideTimer = 0;
+  // Warnings the IronRDP clipboard code logs (e.g. the server does not allow
+  // file copy), shown when an upload fails or never starts.
+  let lastClipboardWarning = '';
+  for (const level of ['warn', 'error']) {
+    const original = console[level].bind(console);
+    console[level] = (...args) => {
+      const text = args.map(String).join(' ');
+      if (/FILECLIP|FileContents|FileGroupDescriptor|file copy|file list|Cliprdr/i.test(text)) {
+        lastClipboardWarning = text.replace(/\s+/g, ' ')
+          .replace(/^\S+Z (ERROR|WARN) [\w:]+: /, '').slice(0, 400);
+      }
+      original(...args);
+    };
+  }
+  const hideUploadsLater = (delay) => {
+    window.clearTimeout(uploadHideTimer);
+    uploadHideTimer = window.setTimeout(() => { uploadsElement.hidden = true; }, delay);
+  };
+  const setRow = (row, text, fraction) => {
+    row.state.textContent = text;
+    row.state.title = text;
+    if (fraction != null) row.fill.style.width = `${Math.max(0, Math.min(1, fraction)) * 100}%`;
+  };
+  // IronRDP keeps an upload pending until Windows has read every file, and
+  // refuses new uploads meanwhile. A new pick replaces a pending one.
+  const abandonPendingUpload = () => {
+    const state = fileTransfer.uploadState;
+    if (state === undefined) return;
+    for (const timer of state.readerTimeouts?.values?.() || []) clearTimeout(timer);
+    for (const reader of state.activeReaders?.values?.() || []) {
+      try { reader.abort(); } catch (error) { /* already done */ }
+    }
+    fileTransfer.uploadState = undefined;
+    fileTransfer.retainedFiles = undefined;
+    try { state.resolve?.(); } catch (error) { /* ignore */ }
+  };
+  const updateUploadTitle = () => {
+    if (!upload) return;
+    const { rows } = upload;
+    const done = rows.filter((row) => row.done).length;
+    const failed = rows.filter((row) => row.failed).length;
+    if (upload.phase === 'reading') {
+      const total = rows.reduce((sum, row) => sum + (row.size || 0), 0);
+      const read = rows.reduce((sum, row) => sum + (row.read || 0), 0);
+      upload.title.textContent = total
+        ? `Reading from phone… ${Math.round((read / total) * 100)}%`
+        : 'Reading from phone…';
+      return;
+    }
+    if (done + failed < rows.length) {
+      const total = rows.reduce((sum, row) => sum + (row.size || 0), 0);
+      const sent = rows.reduce((sum, row) => sum + (row.sent || 0), 0);
+      upload.title.textContent = sent
+        ? `Uploading to the PC… ${total ? Math.round((sent / total) * 100) : 0}%`
+        : (rows.length === 1
+          ? 'Ready: paste it in a Windows folder (Ctrl+V)'
+          : `${rows.length} files ready: paste them in a Windows folder (Ctrl+V)`);
+      return;
+    }
+    upload.paste.hidden = true;
+    if (failed) {
+      upload.title.textContent = failed === rows.length
+        ? 'Upload failed'
+        : `Uploaded ${done} of ${rows.length}, ${failed} failed`;
+      return;
+    }
+    upload.title.textContent = rows.length === 1 ? 'Upload complete ✓' : `${rows.length} files uploaded ✓`;
+    hideUploadsLater(3000);
+  };
+  const failRow = (row, message) => {
+    row.failed = true;
+    row.done = false;
+    row.element.classList.add('failed');
+    setRow(row, `Failed: ${message}`, null);
+    row.state.title = message;
+  };
+  window.__rdpUploadFromApp = async (items) => {
+    window.clearTimeout(uploadHideTimer);
+    abandonPendingUpload();
+    lastClipboardWarning = '';
     uploadsElement.replaceChildren();
     const header = document.createElement('header');
     const title = document.createElement('span');
-    title.textContent = titleText;
+    const paste = document.createElement('button');
+    paste.textContent = 'Paste';
+    paste.title = 'Send Ctrl+V to Windows';
+    paste.hidden = true;
+    paste.addEventListener('click', () => ui?.ctrlV?.());
     const close = document.createElement('button');
     close.className = 'plain';
     close.textContent = '✕';
-    close.addEventListener('click', () => { uploadsElement.hidden = true; });
-    header.append(title, close);
+    close.addEventListener('click', () => {
+      window.clearTimeout(uploadHideTimer);
+      uploadsElement.hidden = true;
+    });
+    header.append(title, paste, close);
     uploadsElement.append(header);
+    const rows = items.map((item) => {
+      const element = document.createElement('div');
+      element.className = 'item';
+      const line = document.createElement('div');
+      line.className = 'row';
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = item.name;
+      const state = document.createElement('span');
+      state.className = 'state';
+      line.append(name, state);
+      const bar = document.createElement('div');
+      bar.className = 'bar';
+      const fill = document.createElement('i');
+      bar.append(fill);
+      element.append(line, bar);
+      uploadsElement.append(element);
+      const row = { element, state, fill, size: item.size > 0 ? item.size : 0, read: 0, sent: 0 };
+      setRow(row, formatSize(item.size) || 'Waiting', 0);
+      return row;
+    });
+    upload = { rows, title, paste, phase: 'reading', byTransferId: new Map(), byFile: new Map() };
+    const current = upload;
     uploadsElement.hidden = false;
-    return title;
-  };
-  const uploadRow = (name, stateText) => {
-    const element = document.createElement('div');
-    element.className = 'row';
-    const label = document.createElement('span');
-    label.className = 'name';
-    label.textContent = name;
-    const state = document.createElement('span');
-    state.className = 'state';
-    state.textContent = stateText;
-    element.append(label, state);
-    uploadsElement.append(element);
-    return state;
-  };
-  window.__rdpUploadFromApp = async (items) => {
-    const title = uploadBar(items.length === 1 ? 'Preparing 1 file…' : `Preparing ${items.length} files…`);
-    const states = items.map((item) => uploadRow(item.name, formatSize(item.size)));
+    updateUploadTitle();
+
     const files = [];
-    const fileStates = [];
+    const pickedRows = [];
     for (let index = 0; index < items.length; index += 1) {
       const item = items[index];
+      const row = rows[index];
       try {
         const response = await fetch(
           `/upload?t=${encodeURIComponent(sessionToken)}&id=${encodeURIComponent(item.id)}`
         );
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const blob = await response.blob();
-        const file = new File([blob], item.name, { lastModified: Date.now() });
+        if (!response.ok) {
+          throw new Error(response.status === 404 ? 'expired, pick the file again' : `HTTP ${response.status}`);
+        }
+        const length = Number(response.headers.get('Content-Length')) || row.size;
+        row.size = length;
+        const chunks = [];
+        const reader = response.body.getReader();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          row.read += value.length;
+          setRow(row, length ? `Reading ${Math.round((row.read / length) * 100)}%` : `Reading ${formatSize(row.read)}`,
+            length ? (row.read / length) * 0.3 : null);
+          if (current === upload) updateUploadTitle();
+        }
+        if (length && row.read < length) throw new Error('the file could not be read completely');
+        row.size = row.read;
+        const file = new File(chunks, item.name, { lastModified: Date.now() });
         files.push(file);
-        fileStates.push(states[index]);
-        uploadStateByFile.set(file, states[index]);
-        states[index].textContent = formatSize(blob.size) || 'Ready';
+        pickedRows.push(row);
+        current.byFile.set(file, row);
+        setRow(row, `${formatSize(file.size) || '0 B'} · waiting for paste`, 0.3);
       } catch (error) {
-        states[index].textContent = `Failed: ${String(error?.message || error).slice(0, 60)}`;
+        failRow(row, String(error?.message || error).slice(0, 80));
       }
     }
+    if (current !== upload) return;
+    current.phase = 'clipboard';
     if (!files.length) {
-      title.textContent = 'Could not read the files';
+      updateUploadTitle();
       return;
     }
-    uploadRows.clear();
     try {
-      const { transferIds } = fileTransfer.uploadFiles(files);
+      const { transferIds, completion } = fileTransfer.uploadFiles(files);
       for (const [fileIndex, transferId] of transferIds || []) {
-        uploadRows.set(transferId, fileStates[fileIndex]);
+        current.byTransferId.set(transferId, pickedRows[fileIndex]);
       }
+      completion?.catch((error) => {
+        if (current !== upload) return;
+        for (const row of pickedRows) {
+          if (!row.done && !row.failed) failRow(row, String(error?.message || error).slice(0, 80));
+        }
+        updateUploadTitle();
+      });
     } catch (error) {
-      title.textContent = `Upload failed: ${String(error?.message || error).slice(0, 80)}`;
+      const reason = lastClipboardWarning || String(error?.message || error);
+      for (const row of pickedRows) failRow(row, reason.slice(0, 120));
+      current.title.textContent = 'Could not put the files on the remote clipboard';
       return;
     }
-    title.textContent = files.length === 1
-      ? 'On the remote clipboard: paste it in Windows (Ctrl+V)'
-      : `${files.length} files on the remote clipboard: paste them in Windows (Ctrl+V)`;
+    // IronRDP only logs a refused file list (the call itself succeeds).
+    const refused = () => /Initiate file copy failed|FILECLIP_ENABLED not negotiated/i.test(lastClipboardWarning);
+    const failRefused = () => {
+      abandonPendingUpload();
+      const reason = /not in Ready state/i.test(lastClipboardWarning)
+        ? 'the PC\'s clipboard is not available (clipboard redirection off, or still starting)'
+        : /not negotiated/i.test(lastClipboardWarning)
+          ? 'the PC does not allow file copy over the clipboard'
+          : lastClipboardWarning;
+      for (const row of pickedRows) failRow(row, reason);
+      current.paste.hidden = true;
+      current.title.textContent = 'Upload failed: try again';
+      current.title.title = lastClipboardWarning;
+    };
+    if (refused()) {
+      failRefused();
+      return;
+    }
+    current.paste.hidden = false;
+    updateUploadTitle();
+    window.setTimeout(() => {
+      if (current === upload && refused() && !pickedRows.some((row) => row.sent)) failRefused();
+    }, 500);
   };
   fileTransfer.on('upload-progress', (progress) => {
-    const state = uploadRows.get(progress.transferId);
-    if (state) state.textContent = `${Math.round(progress.percentage)}%`;
+    const row = upload?.byTransferId.get(progress.transferId);
+    if (!row) return;
+    // A re-paste starts over.
+    if (row.done && progress.bytesTransferred < progress.totalBytes) row.done = false;
+    row.sent = progress.bytesTransferred;
+    setRow(row, `Uploading ${Math.round(progress.percentage)}%`, 0.3 + (progress.percentage / 100) * 0.7);
+    if (uploadsElement.hidden) {
+      window.clearTimeout(uploadHideTimer);
+      uploadsElement.hidden = false;
+    }
+    updateUploadTitle();
   });
   fileTransfer.on('upload-complete', (file) => {
-    const state = uploadStateByFile.get(file);
-    if (state) state.textContent = 'Copied';
+    const row = upload?.byFile.get(file);
+    if (!row) return;
+    row.done = true;
+    row.sent = row.size;
+    setRow(row, 'Done ✓', 1);
+    updateUploadTitle();
   });
   fileTransfer.on('error', (error) => {
     console.warn('file transfer:', error.message);
-    const state = error.transferId != null
-      ? (uploadRows.get(error.transferId) || fileRows.get(error.transferId)?.state)
-      : null;
-    if (state) state.textContent = `Failed: ${String(error.message).slice(0, 60)}`;
+    if (error.transferId == null) return;
+    const uploadRow = upload?.byTransferId.get(error.transferId);
+    if (uploadRow) {
+      failRow(uploadRow, String(error.message).slice(0, 80));
+      updateUploadTitle();
+      return;
+    }
+    const downloadRow = fileRows.get(error.transferId);
+    if (downloadRow) downloadRow.state.textContent = 'Failed';
   });
 
   element.addEventListener('ready', (event) => {

@@ -1248,7 +1248,7 @@ private let keyboardBridgeSource = #"""
         display: flex; align-items: center; justify-content: center;
         font-family: system-ui, sans-serif; font-weight: 700; color: #fff;
         background: rgba(0, 0, 0, 0.31); border: 2px solid rgba(255, 255, 255, 0.6);
-        pointer-events: auto; touch-action: none;
+        pointer-events: none; touch-action: none;
         user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
       }
       .button.pressed { background: rgba(103, 80, 164, 0.67); }
