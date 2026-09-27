@@ -218,7 +218,7 @@
     nativeBridge ? nativeBridge.config(sessionToken) : (window.__rdpTestConfig || '{}')
   );
 
-  const { init, Backend, displayControl, RdpFileTransferProvider } =
+  const { init, Backend, displayControl, enableCredssp, RdpFileTransferProvider } =
     await import('./iron-remote-desktop-rdp.js');
   await import('./iron-remote-desktop.js');
   await init('WARN');
@@ -451,6 +451,14 @@
     setTimeout(connect, delay);
   };
 
+  // NLA (CredSSP/NTLM) in IronRDP splits an e-mail user name into user and
+  // domain ("name" + "outlook.com"), which a PC signed in with a Microsoft
+  // account rejects. Such names get one retry without NLA, where Windows
+  // receives the full name in the logon information.
+  const username = config.username || '';
+  const emailUsername = username.includes('@') && !username.includes('\\') && !config.domain;
+  let withoutNla = false;
+
   async function connect() {
     if (!attempts) showStatus('Connecting…');
     const size = desktopSize();
@@ -463,11 +471,30 @@
       .withDesktopSize(size)
       .withExtension(displayControl(true));
     if (config.domain) builder.withServerDomain(config.domain);
+    if (withoutNla) builder.withExtension(enableCredssp(false));
     let session;
     try {
       session = await ui.connect(builder.build());
     } catch (error) {
       const { kind, detail, status } = describeError(error);
+      const gateway = gatewayStatus();
+      const signInFailed = kind === 'WrongPassword' || kind === 'LogonFailure'
+        || (gateway.stage === 'relay' && kind === 'General');
+      if (emailUsername && !withoutNla && signInFailed) {
+        withoutNla = true;
+        showStatus('Signing in with the full e-mail user name…');
+        connect();
+        return;
+      }
+      if (withoutNla && kind === 'NegotiationFailure') {
+        withoutNla = false;
+        const message = 'This PC requires Network Level Authentication, which cannot send '
+          + 'an e-mail user name here. Use the PC\'s local account name instead '
+          + '(run whoami on the PC).';
+        showStatus('Windows sign-in failed.', message);
+        notifyNative('sign_in_failed', message);
+        return;
+      }
       if (kind === 'WrongPassword' || kind === 'LogonFailure' || kind === 'AccessDenied') {
         showStatus('Windows rejected the user name or password.');
         notifyNative('credentials_rejected', kind);
@@ -478,7 +505,6 @@
         notifyNative('login_required');
         return;
       }
-      const gateway = gatewayStatus();
       if (gateway.stage === 'relay' && kind === 'General') {
         // TLS to the PC worked but the connection ended during CredSSP/NLA:
         // almost always a rejected sign-in. Retrying could lock the account.
