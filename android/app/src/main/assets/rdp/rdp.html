@@ -37,6 +37,68 @@
   #status[hidden] {
     display: none;
   }
+  #downloads {
+    position: fixed;
+    left: 50%;
+    bottom: 12px;
+    transform: translateX(-50%);
+    width: min(440px, calc(100% - 24px));
+    box-sizing: border-box;
+    padding: 10px 12px;
+    border-radius: 14px;
+    background: rgba(243, 243, 243, 0.95);
+    color: #222;
+    font-size: 13px;
+    box-shadow: 0 4px 18px rgba(0, 0, 0, 0.25);
+  }
+  #downloads[hidden] {
+    display: none;
+  }
+  #downloads header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 600;
+    margin-bottom: 6px;
+  }
+  #downloads header span {
+    flex: 1;
+  }
+  #downloads .row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+  }
+  #downloads .name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  #downloads .state {
+    color: #666;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  #downloads button {
+    border: 0;
+    border-radius: 8px;
+    padding: 5px 10px;
+    background: #6750a4;
+    color: #fff;
+    font-size: 12px;
+  }
+  #downloads button.plain {
+    background: transparent;
+    color: #444;
+    font-size: 15px;
+    padding: 2px 6px;
+  }
+  #downloads button:disabled {
+    opacity: 0.5;
+  }
   #status small {
     display: block;
     margin-top: 6px;
@@ -48,6 +110,7 @@
 </head>
 <body>
 <div id="status">Connecting…</div>
+<div id="downloads" hidden></div>
 <script>
   // Tells the app's page bridge to leave the viewport alone (see rdp zoom).
   window.__yourWorkspaceRdpPage = true;
@@ -123,7 +186,8 @@
     nativeBridge ? nativeBridge.config(sessionToken) : (window.__rdpTestConfig || '{}')
   );
 
-  const { init, Backend, displayControl } = await import('./iron-remote-desktop-rdp.js');
+  const { init, Backend, displayControl, RdpFileTransferProvider } =
+    await import('./iron-remote-desktop-rdp.js');
   await import('./iron-remote-desktop.js');
   await init('WARN');
 
@@ -441,10 +505,111 @@
   new ResizeObserver(onAreaChanged).observe(document.documentElement);
   window.addEventListener('yourworkspace-rdp-zoom', onAreaChanged);
 
+  // Files copied on the remote PC: offered in a bar at the bottom, fetched over
+  // the RDP clipboard channel and saved by the app to the device's Downloads.
+  const downloadsElement = document.getElementById('downloads');
+  const fileTransfer = new RdpFileTransferProvider();
+  const fileRows = new Map();
+  const formatSize = (bytes) => {
+    if (!bytes) return '';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let value = bytes;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit += 1;
+    }
+    return `${value.toFixed(unit ? 1 : 0)} ${units[unit]}`;
+  };
+  const saveToDevice = async (name, blob) => {
+    const response = await fetch(
+      `/download?t=${encodeURIComponent(sessionToken)}&name=${encodeURIComponent(name)}`,
+      { method: 'POST', body: blob, headers: { 'Content-Type': 'application/octet-stream' } }
+    );
+    const text = await response.text();
+    if (!response.ok) throw new Error(text || `HTTP ${response.status}`);
+    return JSON.parse(text).savedAs;
+  };
+  const downloadFile = async (file, index, row) => {
+    row.button.disabled = true;
+    row.state.textContent = 'Downloading…';
+    try {
+      const { transferId, completion } = fileTransfer.downloadFile(file, index);
+      fileRows.set(transferId, row);
+      const blob = await completion;
+      row.state.textContent = 'Saving…';
+      const savedAs = await saveToDevice(file.name, blob);
+      row.state.textContent = `Saved to ${savedAs}`;
+      notifyNative('file_saved', savedAs);
+    } catch (error) {
+      row.state.textContent = `Failed: ${String(error?.message || error).slice(0, 80)}`;
+      row.button.disabled = false;
+    }
+  };
+  const showFiles = (files) => {
+    downloadsElement.replaceChildren();
+    const entries = files
+      .map((file, index) => ({ file, index }))
+      .filter(({ file }) => !file.isDirectory);
+    if (!entries.length) {
+      downloadsElement.hidden = true;
+      return;
+    }
+    const header = document.createElement('header');
+    const title = document.createElement('span');
+    title.textContent = entries.length === 1
+      ? 'File copied on the remote PC'
+      : `${entries.length} files copied on the remote PC`;
+    const all = document.createElement('button');
+    all.textContent = 'Download all';
+    const close = document.createElement('button');
+    close.className = 'plain';
+    close.textContent = '✕';
+    close.addEventListener('click', () => { downloadsElement.hidden = true; });
+    header.append(title);
+    if (entries.length > 1) header.append(all);
+    header.append(close);
+    downloadsElement.append(header);
+    const rows = entries.slice(0, 20).map(({ file, index }) => {
+      const element = document.createElement('div');
+      element.className = 'row';
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = file.path ? `${file.path}\\${file.name}` : file.name;
+      const state = document.createElement('span');
+      state.className = 'state';
+      state.textContent = formatSize(file.size);
+      const button = document.createElement('button');
+      button.textContent = 'Download';
+      const row = { state, button };
+      button.addEventListener('click', () => downloadFile(file, index, row));
+      element.append(name, state, button);
+      downloadsElement.append(element);
+      return { file, index, row };
+    });
+    all.addEventListener('click', async () => {
+      all.disabled = true;
+      for (const { file, index, row } of rows) {
+        if (!row.button.disabled) await downloadFile(file, index, row);
+      }
+    });
+    downloadsElement.hidden = false;
+  };
+  fileTransfer.on('files-available', showFiles);
+  fileTransfer.on('download-progress', (progress) => {
+    const row = fileRows.get(progress.transferId);
+    if (row) row.state.textContent = `${Math.round(progress.percentage)}%`;
+  });
+  fileTransfer.on('error', (error) => console.warn('file transfer:', error.message));
+
   element.addEventListener('ready', (event) => {
     ui = event.detail.irgUserInteraction;
     ui.setEnableClipboard(true);
     ui.setEnableAutoClipboard(true);
+    ui.enableFileTransfer(fileTransfer);
+    // Characters without a physical key (Chinese, ...) are sent as Unicode;
+    // the app's keyboard bridge switches this on for just those characters.
+    window.__rdpKeyboardUnicodeMode = (enabled) => ui.setKeyboardUnicodeMode(Boolean(enabled));
     // The component sets up its clipboard handlers right after this event;
     // connecting synchronously would build the session without them.
     window.setTimeout(connect, 100);

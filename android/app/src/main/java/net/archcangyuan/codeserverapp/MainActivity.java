@@ -241,7 +241,7 @@ public final class MainActivity extends Activity {
           window.__codeServerAppIsRdpPage = () => Boolean(findIronRdpCanvas());
 
           const existingBridge = window.__codeServerAppKeyboard;
-          if (existingBridge && existingBridge.version >= 14) {
+          if (existingBridge && existingBridge.version >= 15) {
             window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
             existingBridge.installRdpGestures?.();
             existingBridge.installDesktopGestures?.();
@@ -888,7 +888,16 @@ public final class MainActivity extends Activity {
           const forwardText = (text) => {
             for (const key of Array.from(text || '')) {
               const info = keyInfoForText(key);
-              dispatchCompleteKey(key, info.code, info.keyCode, info.shift);
+              // IronRDP sends scancodes and drops characters without a physical
+              // key (Chinese, Japanese, ...). The built-in remote desktop page
+              // lets its Unicode mode be switched on for just those characters.
+              const unicodeMode = !info.code ? window.__rdpKeyboardUnicodeMode : null;
+              if (typeof unicodeMode === 'function') unicodeMode(true);
+              try {
+                dispatchCompleteKey(key, info.code, info.keyCode, info.shift);
+              } finally {
+                if (typeof unicodeMode === 'function') unicodeMode(false);
+              }
             }
           };
 
@@ -1797,7 +1806,7 @@ public final class MainActivity extends Activity {
           };
 
           const bridge = {
-            version: 14,
+            version: 15,
             forceKeyboard,
             installRdpGestures,
             installDesktopGestures,
@@ -3326,6 +3335,9 @@ public final class MainActivity extends Activity {
             break;
         case "login_required":
             rdpPanel.show(session.address, "Cloudflare sign-in expired. Sign in again to reconnect.");
+            break;
+        case "file_saved":
+            Toast.makeText(this, "Saved to " + detail, Toast.LENGTH_SHORT).show();
             break;
         case "failed":
             Toast.makeText(

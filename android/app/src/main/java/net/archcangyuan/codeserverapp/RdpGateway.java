@@ -57,6 +57,12 @@ final class RdpGateway {
         void clearToken(String host);
 
         AccessWebSocket openTunnel(String host, AccessCredential credential) throws IOException;
+
+        /**
+         * Saves a file downloaded from the remote PC; returns where it went,
+         * for display (e.g. "Downloads/report.pdf").
+         */
+        String saveDownload(String name, InputStream content, long length) throws IOException;
     }
 
     private static final String ASSET_DIRECTORY = "rdp/";
@@ -126,6 +132,12 @@ final class RdpGateway {
                 public AccessWebSocket openTunnel(String host, AccessCredential credential)
                     throws IOException {
                     return AccessWebSocket.connect(host, credential);
+                }
+
+                @Override
+                public String saveDownload(String name, InputStream content, long length)
+                    throws IOException {
+                    return DownloadSaver.save(appContext, name, content, length);
                 }
             });
         }
@@ -219,9 +231,11 @@ final class RdpGateway {
             InputStream input = new BufferedInputStream(client.getInputStream());
             String requestLine = readLine(input);
             String[] parts = requestLine.split(" ");
+            String method = parts.length >= 1 ? parts[0] : "";
             String path = parts.length >= 2 ? parts[1] : "/";
             String webSocketKey = null;
             boolean upgrade = false;
+            long contentLength = -1L;
             for (String line = readLine(input); !line.isEmpty(); line = readLine(input)) {
                 int colon = line.indexOf(':');
                 if (colon <= 0) {
@@ -229,7 +243,13 @@ final class RdpGateway {
                 }
                 String name = line.substring(0, colon).trim().toLowerCase(Locale.US);
                 String value = line.substring(colon + 1).trim();
-                if (name.equals("sec-websocket-key")) {
+                if (name.equals("content-length")) {
+                    try {
+                        contentLength = Long.parseLong(value);
+                    } catch (NumberFormatException ignored) {
+                        contentLength = -1L;
+                    }
+                } else if (name.equals("sec-websocket-key")) {
                     webSocketKey = value;
                 } else if (name.equals("upgrade") && value.equalsIgnoreCase("websocket")) {
                     upgrade = true;
@@ -238,6 +258,8 @@ final class RdpGateway {
             if (upgrade && webSocketKey != null && path.startsWith("/gw")) {
                 AccessWebSocket webSocket = AccessWebSocket.acceptServer(client, input, webSocketKey);
                 runCleanPathSession(webSocket);
+            } else if (method.equals("POST") && path.startsWith("/download?")) {
+                saveDownload(client, input, path, contentLength);
             } else {
                 serveAsset(client, path);
             }
@@ -278,6 +300,106 @@ final class RdpGateway {
         output.write(body);
         output.flush();
         closeQuietly(client);
+    }
+
+    /**
+     * Saves a file the page downloaded from the remote PC. Only pages holding a
+     * session token may do this, since other apps can reach the loopback port.
+     */
+    private void saveDownload(Socket client, InputStream input, String path, long length)
+        throws IOException {
+        OutputStream output = client.getOutputStream();
+        Map<String, String> query = parseQuery(path.substring(path.indexOf('?') + 1));
+        String name = query.get("name");
+        if (!sessionHosts.containsKey(query.getOrDefault("t", ""))
+            || name == null || name.isEmpty() || length < 0) {
+            writeStatus(output, "403 Forbidden");
+            closeQuietly(client);
+            return;
+        }
+        client.setSoTimeout(60_000);
+        String savedAs;
+        try {
+            savedAs = environment.saveDownload(name, new BoundedInputStream(input, length), length);
+        } catch (IOException | RuntimeException exception) {
+            byte[] body = describe(exception).getBytes(StandardCharsets.UTF_8);
+            output.write(("HTTP/1.1 500 Internal Server Error\r\n"
+                + "Content-Type: text/plain; charset=utf-8\r\n"
+                + "Content-Length: " + body.length + "\r\n"
+                + "Connection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+            output.write(body);
+            output.flush();
+            closeQuietly(client);
+            return;
+        }
+        org.json.JSONObject result = new org.json.JSONObject();
+        try {
+            result.put("savedAs", savedAs);
+        } catch (org.json.JSONException ignored) {
+            // A plain string.
+        }
+        byte[] body = result.toString().getBytes(StandardCharsets.UTF_8);
+        output.write(("HTTP/1.1 200 OK\r\n"
+            + "Content-Type: application/json\r\n"
+            + "Content-Length: " + body.length + "\r\n"
+            + "Connection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+        output.write(body);
+        output.flush();
+        closeQuietly(client);
+    }
+
+    private static Map<String, String> parseQuery(String query) {
+        Map<String, String> values = new java.util.HashMap<>();
+        for (String pair : query.split("&")) {
+            int equals = pair.indexOf('=');
+            if (equals <= 0) {
+                continue;
+            }
+            try {
+                values.put(
+                    java.net.URLDecoder.decode(pair.substring(0, equals), "UTF-8"),
+                    java.net.URLDecoder.decode(pair.substring(equals + 1), "UTF-8")
+                );
+            } catch (java.io.UnsupportedEncodingException | IllegalArgumentException ignored) {
+                // Skip malformed pairs.
+            }
+        }
+        return values;
+    }
+
+    /** Reads at most {@code limit} bytes: the request body. */
+    private static final class BoundedInputStream extends InputStream {
+        private final InputStream input;
+        private long remaining;
+
+        BoundedInputStream(InputStream input, long limit) {
+            this.input = input;
+            this.remaining = limit;
+        }
+
+        @Override
+        public int read() throws IOException {
+            if (remaining <= 0) {
+                return -1;
+            }
+            int value = input.read();
+            if (value >= 0) {
+                remaining--;
+            }
+            return value;
+        }
+
+        @Override
+        public int read(byte[] buffer, int offset, int length) throws IOException {
+            if (remaining <= 0) {
+                return -1;
+            }
+            int count = input.read(buffer, offset, (int) Math.min(length, remaining));
+            if (count > 0) {
+                remaining -= count;
+            }
+            return count;
+        }
     }
 
     private static void writeStatus(OutputStream output, String status) throws IOException {

@@ -145,7 +145,7 @@ private let keyboardBridgeSource = #"""
   window.__codeServerAppIsRdpPage = () => Boolean(findIronRdpCanvas());
 
   const existingBridge = window.__codeServerAppKeyboard;
-  if (existingBridge && existingBridge.version >= 14) {
+  if (existingBridge && existingBridge.version >= 15) {
     window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
     existingBridge.installRdpGestures?.();
     existingBridge.installDesktopGestures?.();
@@ -1567,7 +1567,7 @@ private let keyboardBridgeSource = #"""
   };
 
   const bridge = {
-    version: 14,
+    version: 15,
     forceKeyboard() {
       installRdpGestures();
       const canvas = findIronRdpCanvas();
