@@ -91,6 +91,12 @@ final class RdpPageBridge {
     @JavascriptInterface
     public String clipboardText() {
         FutureTask<String> read = new FutureTask<>(() -> {
+            // Without window focus (e.g. a file picker in front) Android hides the
+            // clipboard. null tells the page "unknown", not "empty": an empty
+            // read would look like a new copy and replace the PC's clipboard.
+            if (!activity.hasWindowFocus()) {
+                return null;
+            }
             ClipboardManager clipboard = activity.getSystemService(ClipboardManager.class);
             ClipData clip = clipboard == null ? null : clipboard.getPrimaryClip();
             if (clip == null || clip.getItemCount() == 0) {
@@ -103,7 +109,7 @@ final class RdpPageBridge {
         try {
             return read.get(2, TimeUnit.SECONDS);
         } catch (Exception exception) {
-            return "";
+            return null;
         }
     }
 

@@ -203,7 +203,11 @@
     // (copied on the phone, or text copied on the PC arrived).
     let lastClipboardText = null;
     const readText = async () => {
-      const text = nativeBridge.clipboardText() || '';
+      const read = nativeBridge.clipboardText();
+      // null: the clipboard cannot be read right now (the app is in the
+      // background); keep reporting the last content so nothing looks copied.
+      if (read === null || read === undefined) return lastClipboardText ?? '';
+      const text = read;
       if (lastClipboardText !== null && text !== lastClipboardText) {
         window.dispatchEvent(new Event('yourworkspace-clipboard-replaced'));
       }
@@ -706,10 +710,13 @@
   // Warnings the IronRDP clipboard code logs (e.g. the server does not allow
   // file copy), shown when an upload fails or never starts.
   let lastClipboardWarning = '';
+  // Logged once when the session starts: the PC does not take files.
+  let clipboardCapabilityWarning = '';
   for (const level of ['warn', 'error']) {
     const original = console[level].bind(console);
     console[level] = (...args) => {
       const text = args.map(String).join(' ');
+      if (/not negotiated/i.test(text)) clipboardCapabilityWarning = text.slice(0, 400);
       if (/FILECLIP|FileContents|FileGroupDescriptor|file copy|file list|Cliprdr/i.test(text)) {
         lastClipboardWarning = text.replace(/\s+/g, ' ')
           .replace(/^\S+Z (ERROR|WARN) [\w:]+: /, '').slice(0, 400);
@@ -887,6 +894,9 @@
       return;
     }
     // IronRDP only logs a refused file list (the call itself succeeds).
+    if (!lastClipboardWarning && /FILECLIP_ENABLED not negotiated/i.test(clipboardCapabilityWarning)) {
+      lastClipboardWarning = clipboardCapabilityWarning;
+    }
     const refused = () => /Initiate file copy failed|FILECLIP_ENABLED not negotiated/i.test(lastClipboardWarning);
     const failRefused = () => {
       abandonPendingUpload();
