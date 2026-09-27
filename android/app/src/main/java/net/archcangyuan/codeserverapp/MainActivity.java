@@ -2967,11 +2967,13 @@ public final class MainActivity extends Activity {
                         handled = true;
                         if (!openerIsRemoteDesktop && sameSite(openerUrl, uri)) {
                             String address = uri.toString();
-                            popupView.post(() -> openNewWindowAsProject(address));
+                            // The popup is never attached to a window, so its own
+                            // post() queue would never run: use the main handler.
+                            addressBarHandler.post(() -> openNewWindowAsProject(address));
                         } else {
                             openExternalUrl(uri);
                         }
-                        popupView.post(() -> {
+                        addressBarHandler.post(() -> {
                             popupView.stopLoading();
                             popupView.destroy();
                         });
@@ -4237,9 +4239,13 @@ public final class MainActivity extends Activity {
         if (normalized.isEmpty()) {
             return;
         }
+        boolean alreadyOpen = findProjectSession(normalized) != null;
         switchToProjectUrl(normalized);
         for (ProjectProfile project : projects) {
             if (addressesEquivalent(project.url, normalized)) {
+                if (alreadyOpen) {
+                    Toast.makeText(this, project.name + " is already open", Toast.LENGTH_SHORT).show();
+                }
                 return;
             }
         }
