@@ -2951,7 +2951,11 @@ public final class MainActivity extends Activity {
                 Message resultMsg
             ) {
                 // Links opened with window.open (e.g. terminal and editor links) go to
-                // the system browser instead of replacing the code-server page.
+                // the system browser instead of replacing the code-server page. A new
+                // window on the same site (code-server's New Window, a folder opened
+                // in a new window) becomes a new project session in the app.
+                String openerUrl = view.getUrl();
+                boolean openerIsRemoteDesktop = rdpWebViews.contains(view);
                 WebView popup = new WebView(view.getContext());
                 popup.setWebViewClient(new WebViewClient() {
                     private boolean handled;
@@ -2961,7 +2965,12 @@ public final class MainActivity extends Activity {
                             return;
                         }
                         handled = true;
-                        openExternalUrl(uri);
+                        if (!openerIsRemoteDesktop && sameSite(openerUrl, uri)) {
+                            String address = uri.toString();
+                            popupView.post(() -> openNewWindowAsProject(address));
+                        } else {
+                            openExternalUrl(uri);
+                        }
                         popupView.post(() -> {
                             popupView.stopLoading();
                             popupView.destroy();
@@ -4183,13 +4192,64 @@ public final class MainActivity extends Activity {
         return label;
     }
 
-    /** A readable default name: the host of the address. */
+    /**
+     * A readable default name: the folder or workspace code-server opens
+     * (?folder=/path, ?workspace=/path.code-workspace), else the host.
+     */
     private static String suggestedProjectName(String url) {
         if (RdpConnectionPanel.isRdpAddress(url)) {
             return RdpConnectionPanel.hostOf(url);
         }
-        String host = Uri.parse(url).getHost();
+        Uri uri = Uri.parse(url);
+        for (String parameter : new String[] { "folder", "workspace" }) {
+            String path = null;
+            try {
+                path = uri.getQueryParameter(parameter);
+            } catch (UnsupportedOperationException ignored) {
+                // Not a hierarchical URI.
+            }
+            if (path != null && !path.isEmpty()) {
+                String trimmed = path.replaceAll("/+$", "");
+                String base = trimmed.substring(trimmed.lastIndexOf('/') + 1)
+                    .replaceAll("\\.code-workspace$", "");
+                if (!base.isEmpty()) {
+                    return base;
+                }
+            }
+        }
+        String host = uri.getHost();
         return host == null || host.isEmpty() ? url : host;
+    }
+
+    private static boolean sameSite(String openerUrl, Uri target) {
+        if (openerUrl == null || target == null || target.getHost() == null) {
+            return false;
+        }
+        Uri opener = Uri.parse(openerUrl);
+        return target.getHost().equalsIgnoreCase(opener.getHost())
+            && String.valueOf(target.getScheme()).equalsIgnoreCase(String.valueOf(opener.getScheme()))
+            && target.getPort() == opener.getPort();
+    }
+
+    /** Opens a same-site new window as a project session and offers to save it. */
+    private void openNewWindowAsProject(String url) {
+        String normalized = normalizeAddress(url);
+        if (normalized.isEmpty()) {
+            return;
+        }
+        switchToProjectUrl(normalized);
+        for (ProjectProfile project : projects) {
+            if (addressesEquivalent(project.url, normalized)) {
+                return;
+            }
+        }
+        new AlertDialog.Builder(this)
+            .setTitle(boldText("New window"))
+            .setMessage("Opened as a new session: " + suggestedProjectName(normalized)
+                + "\nSave it as a project?")
+            .setPositiveButton("Save…", (dialog, which) -> showProjectEditor(-1, normalized))
+            .setNegativeButton("Not now", null)
+            .show();
     }
 
     private void openProject(ProjectProfile project) {
