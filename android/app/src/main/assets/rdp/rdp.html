@@ -920,6 +920,17 @@
       if (current === upload && refused() && !pickedRows.some((row) => row.sent)) failRefused();
     }, 500);
   };
+  // The clipboard changed (copied on the phone, or on the PC) before Windows
+  // read the files: the PC's clipboard no longer holds them.
+  window.addEventListener('yourworkspace-clipboard-replaced', () => {
+    if (!upload || upload.phase !== 'clipboard') return;
+    const waiting = upload.rows.filter((row) => !row.done && !row.failed && !row.sent);
+    if (!waiting.length) return;
+    for (const row of waiting) failRow(row, 'the clipboard changed before pasting; upload again');
+    upload.paste.hidden = true;
+    upload.title.textContent = 'Replaced on the PC\'s clipboard';
+    abandonPendingUpload();
+  });
   fileTransfer.on('upload-progress', (progress) => {
     const row = upload?.byTransferId.get(progress.transferId);
     if (!row) return;
