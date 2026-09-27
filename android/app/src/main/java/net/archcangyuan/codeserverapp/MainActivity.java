@@ -81,6 +81,7 @@ public final class MainActivity extends Activity {
     private static final String KEEP_ALIVE_KEY = "keep_alive_enabled";
     private static final String MOUSE_MODE_KEY = "mouse_mode_enabled";
     private static final String FULLSCREEN_KEY = "fullscreen_enabled";
+    private static final String KEYBOARD_LOCK_KEY = "keyboard_lock";
     private static final int KEYBOARD_UNLOCKED = 0;
     private static final int KEYBOARD_LOCKED_OPEN = 1;
     private static final int KEYBOARD_LOCKED_HIDDEN = 2;
@@ -2252,16 +2253,173 @@ public final class MainActivity extends Activity {
         );
         keepAliveCheckBox.setChecked(keepAliveEnabled);
         int padding = dp(20);
-        keepAliveCheckBox.setPadding(padding, dp(8), padding, dp(8));
+        keepAliveCheckBox.setPadding(0, dp(8), 0, dp(8));
+
+        Button tokensButton = new Button(this);
+        tokensButton.setAllCaps(false);
+        tokensButton.setText("Cloudflare Access service tokens…");
+        tokensButton.setOnClickListener(view -> showServiceTokenManager());
+
+        LinearLayout settingsView = new LinearLayout(this);
+        settingsView.setOrientation(LinearLayout.VERTICAL);
+        settingsView.setPadding(padding, dp(4), padding, 0);
+        settingsView.addView(keepAliveCheckBox);
+        settingsView.addView(tokensButton);
 
         new AlertDialog.Builder(this)
             .setTitle(boldText("Settings"))
-            .setView(keepAliveCheckBox)
+            .setView(settingsView)
             .setPositiveButton("Done", (dialog, which) -> {
                 setKeepAliveEnabled(keepAliveCheckBox.isChecked());
             })
             .setNeutralButton("System permissions", (dialog, which) -> {
                 requestKeepAlivePermissions();
+            })
+            .setNegativeButton("Cancel", null)
+            .show();
+    }
+
+    /** Lists the saved Cloudflare Access service tokens; tap one to edit or delete it. */
+    private void showServiceTokenManager() {
+        List<ServiceTokenStore.ServiceToken> tokens = ServiceTokenStore.list(this);
+        List<CharSequence> labels = new ArrayList<>();
+        labels.add("+ Add service token");
+        for (ServiceTokenStore.ServiceToken token : tokens) {
+            labels.add(token.name + "  ·  " + token.maskedClientId());
+        }
+        new AlertDialog.Builder(this)
+            .setTitle(boldText("Cloudflare Access service tokens"))
+            .setItems(labels.toArray(new CharSequence[0]), (dialog, which) -> {
+                if (which == 0) {
+                    showServiceTokenEditor(null);
+                } else {
+                    showServiceTokenActions(tokens.get(which - 1));
+                }
+            })
+            .setNegativeButton("Done", null)
+            .show();
+    }
+
+    private void showServiceTokenActions(ServiceTokenStore.ServiceToken token) {
+        new AlertDialog.Builder(this)
+            .setTitle(boldText(token.name))
+            .setMessage("Client ID " + token.maskedClientId()
+                + "\nThe client secret is stored encrypted and is not shown.")
+            .setPositiveButton("Edit", (dialog, which) -> showServiceTokenEditor(token))
+            .setNeutralButton("Delete", (dialog, which) -> new AlertDialog.Builder(this)
+                .setTitle(boldText("Delete " + token.name + "?"))
+                .setMessage("Projects that use it go back to browser sign-in.")
+                .setPositiveButton("Delete", (confirm, button) -> {
+                    ServiceTokenStore.delete(this, token.id);
+                    showServiceTokenManager();
+                })
+                .setNegativeButton("Cancel", null)
+                .show())
+            .setNegativeButton("Cancel", null)
+            .show();
+    }
+
+    /** Adds a service token, or edits one (an empty secret keeps the saved one). */
+    private void showServiceTokenEditor(ServiceTokenStore.ServiceToken existing) {
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(dp(20), dp(4), dp(20), 0);
+        EditText nameField = new EditText(this);
+        nameField.setSingleLine(true);
+        nameField.setHint("Name, e.g. Home");
+        EditText idField = new EditText(this);
+        idField.setSingleLine(true);
+        idField.setHint("Client ID (….access)");
+        idField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        EditText secretField = new EditText(this);
+        secretField.setSingleLine(true);
+        secretField.setHint(existing == null ? "Client secret" : "Client secret (leave empty to keep)");
+        secretField.setInputType(
+            InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD
+        );
+        if (existing != null) {
+            nameField.setText(existing.name);
+            idField.setText(existing.clientId);
+        }
+        form.addView(nameField);
+        form.addView(idField);
+        form.addView(secretField);
+        TextView note = new TextView(this);
+        note.setTextSize(12);
+        note.setText("Stored encrypted with the Android Keystore and excluded from backups.");
+        form.addView(note);
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+            .setTitle(boldText(existing == null ? "Add service token" : "Edit service token"))
+            .setView(form)
+            .setPositiveButton("Save", null)
+            .setNegativeButton("Cancel", null)
+            .create();
+        dialog.setOnShowListener(shown -> dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+            .setOnClickListener(view -> {
+                String name = nameField.getText().toString().trim();
+                String clientId = idField.getText().toString().trim();
+                String secret = secretField.getText().toString().trim();
+                if (secret.isEmpty() && existing != null) {
+                    secret = existing.clientSecret;
+                }
+                if (clientId.isEmpty() || secret.isEmpty()) {
+                    Toast.makeText(this, "Enter the client ID and secret", Toast.LENGTH_SHORT)
+                        .show();
+                    return;
+                }
+                if (name.isEmpty()) {
+                    name = "Service token " + (ServiceTokenStore.list(this).size() + 1);
+                }
+                ServiceTokenStore.save(
+                    this,
+                    existing == null ? null : existing.id,
+                    name,
+                    clientId,
+                    secret
+                );
+                dialog.dismiss();
+                Toast.makeText(this, "Service token saved", Toast.LENGTH_SHORT).show();
+                showServiceTokenManager();
+            }));
+        dialog.show();
+    }
+
+    /** Chooses whether a project uses a service token, and which one. */
+    private void chooseProjectServiceToken(ProjectProfile project) {
+        List<ServiceTokenStore.ServiceToken> tokens = ServiceTokenStore.list(this);
+        if (tokens.isEmpty()) {
+            Toast.makeText(
+                this,
+                "Add a token first: Settings → Cloudflare Access service tokens",
+                Toast.LENGTH_LONG
+            ).show();
+            return;
+        }
+        String current = ServiceTokenStore.projectTokenId(this, project.url);
+        CharSequence[] labels = new CharSequence[tokens.size() + 1];
+        labels[0] = "None (browser sign-in)";
+        int checked = 0;
+        for (int index = 0; index < tokens.size(); index++) {
+            labels[index + 1] = tokens.get(index).name;
+            if (tokens.get(index).id.equals(current)) {
+                checked = index + 1;
+            }
+        }
+        new AlertDialog.Builder(this)
+            .setTitle(boldText("Cloudflare Access for " + project.name))
+            .setSingleChoiceItems(labels, checked, (dialog, which) -> {
+                ServiceTokenStore.setForProject(
+                    this,
+                    project.url,
+                    which == 0 ? null : tokens.get(which - 1).id
+                );
+                dialog.dismiss();
+                Toast.makeText(
+                    this,
+                    "Applies the next time " + project.name + " loads",
+                    Toast.LENGTH_SHORT
+                ).show();
             })
             .setNegativeButton("Cancel", null)
             .show();
@@ -2289,9 +2447,16 @@ public final class MainActivity extends Activity {
         ).show();
     }
 
+    /**
+     * Runs the foreground keep-alive service while session keep-alive is on or a
+     * remote desktop is open: without it Android freezes the app in the
+     * background, which stops the remote desktop gateway and drops the session.
+     */
     private void applyKeepAliveMode() {
+        boolean remoteDesktopOpen = !rdpWebViews.isEmpty();
+        KeepAliveService.remoteDesktopActive = remoteDesktopOpen;
         Intent serviceIntent = new Intent(this, KeepAliveService.class);
-        if (keepAliveEnabled) {
+        if (keepAliveEnabled || remoteDesktopOpen) {
             startForegroundService(serviceIntent);
         } else {
             stopService(serviceIntent);
@@ -2365,11 +2530,12 @@ public final class MainActivity extends Activity {
         if (target == null) {
             return;
         }
+        boolean important = keepAliveEnabled || rdpWebViews.contains(target);
         target.setRendererPriorityPolicy(
-            keepAliveEnabled
+            important
                 ? WebView.RENDERER_PRIORITY_IMPORTANT
                 : WebView.RENDERER_PRIORITY_BOUND,
-            !keepAliveEnabled
+            !important
         );
     }
 
@@ -2553,6 +2719,11 @@ public final class MainActivity extends Activity {
             message = "Keyboard locked hidden";
         }
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
+        if (activeSessionKey != null) {
+            preferences.edit()
+                .putInt(projectStateKey(KEYBOARD_LOCK_KEY, activeSessionKey), keyboardLock)
+                .apply();
+        }
         heldImeBottom = keyboardLock == KEYBOARD_LOCKED_OPEN ? heldImeBottom : 0;
         if (keyboardLock == KEYBOARD_LOCKED_HIDDEN) {
             hideSystemKeyboard();
@@ -2692,7 +2863,11 @@ public final class MainActivity extends Activity {
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 // Remote desktop WebViews hold credentials in their JavaScript
                 // bridge, so they never leave the loopback gateway page.
-                return rdpWebViews.contains(view) && !isGatewayUrl(request.getUrl().toString());
+                if (rdpWebViews.contains(view)) {
+                    return !isGatewayUrl(request.getUrl().toString());
+                }
+                return request.isForMainFrame()
+                    && reauthorizeInsteadOfAccessLogin(view, request.getUrl());
             }
 
             @Override
@@ -2753,6 +2928,59 @@ public final class MainActivity extends Activity {
         webView.onResume();
         activeSessionKey = null;
         showZoomOf(null);
+        restoreInputModes(null);
+    }
+
+    /** Per-project preference key; pages outside a project use the global one. */
+    private static String projectStateKey(String base, String sessionKey) {
+        return sessionKey == null ? base : base + ":" + sessionKey;
+    }
+
+    private boolean mouseModeFor(String sessionKey) {
+        boolean global = preferences.getBoolean(MOUSE_MODE_KEY, false);
+        return sessionKey == null
+            ? global
+            : preferences.getBoolean(projectStateKey(MOUSE_MODE_KEY, sessionKey), global);
+    }
+
+    private int keyboardLockFor(String sessionKey) {
+        return sessionKey == null
+            ? KEYBOARD_UNLOCKED
+            : preferences.getInt(projectStateKey(KEYBOARD_LOCK_KEY, sessionKey), KEYBOARD_UNLOCKED);
+    }
+
+    private String sessionKeyOf(WebView target) {
+        if (target == webView) {
+            return activeSessionKey;
+        }
+        for (Map.Entry<String, ProjectSession> entry : projectSessions.entrySet()) {
+            if (entry.getValue().webView == target) {
+                return entry.getKey();
+            }
+        }
+        return null;
+    }
+
+    /** Applies the mouse mode and keyboard lock saved for the project in front. */
+    private void restoreInputModes(String sessionKey) {
+        mouseModeEnabled = mouseModeFor(sessionKey);
+        keyboardLock = keyboardLockFor(sessionKey);
+        heldImeBottom = 0;
+        updateKeyboardLockButton();
+        applyMouseMode();
+        if (webView instanceof RdpInputWebView) {
+            InputMethodManager inputMethodManager =
+                (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (inputMethodManager != null) {
+                inputMethodManager.restartInput(webView);
+            }
+        }
+        if (keyboardLock == KEYBOARD_LOCKED_HIDDEN) {
+            hideSystemKeyboard();
+        } else if (keyboardLock == KEYBOARD_LOCKED_OPEN && !imeShown) {
+            addressBarHandler.removeCallbacks(reshowLockedKeyboard);
+            addressBarHandler.postDelayed(reshowLockedKeyboard, 500L);
+        }
     }
 
     /** Makes the zoom slider show (and set) the zoom of the page in front. */
@@ -2976,7 +3204,7 @@ public final class MainActivity extends Activity {
             String username = AccessTokenStore.username(this, host);
             String password = AccessTokenStore.loadPassword(this, host);
             boolean ready = findProjectSession(normalized) != null
-                || (AccessTokenStore.loadToken(this, host) != null
+                || (AccessTokenStore.credential(this, host) != null
                     && !username.isEmpty()
                     && password != null
                     && !password.isEmpty());
@@ -3005,7 +3233,7 @@ public final class MainActivity extends Activity {
 
         activateProjectSession(normalized, targetSession, now);
         if (created || restoreSavedAddress) {
-            targetSession.webView.loadUrl(normalized);
+            loadProjectUrl(targetSession.webView, normalized);
         }
         evictExcessProjectSessions();
 
@@ -3051,6 +3279,8 @@ public final class MainActivity extends Activity {
             WebView view = createProjectWebView();
             view.addJavascriptInterface(rdpPageBridge, "YourWorkspaceRdp");
             rdpWebViews.add(view);
+            applyWebViewRendererPriority(view);
+            applyKeepAliveMode();
             session = new ProjectSession(view);
             projectSessions.put(normalized, session);
         }
@@ -3109,6 +3339,86 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private final Map<WebView, Long> accessReauthorizedAt = new WeakHashMap<>();
+
+    /**
+     * Loads a web project. With a Cloudflare Access service token chosen for it,
+     * the app first authenticates natively and stores the CF_Authorization
+     * cookie Access returns, so the page and its WebSockets are authorized; the
+     * secret itself is not sent through the page unless no cookie came back.
+     */
+    private void loadProjectUrl(WebView target, String url) {
+        ServiceTokenStore.ServiceToken token = ServiceTokenStore.forProject(this, url);
+        if (token == null || RdpConnectionPanel.isRdpAddress(url)) {
+            target.loadUrl(url);
+            return;
+        }
+        new Thread(() -> {
+            ServiceTokenAuth.Result result = ServiceTokenAuth.authorize(url, token);
+            runOnUiThread(() -> {
+                if (!isProjectWebViewAlive(target)) {
+                    return;
+                }
+                CookieManager cookies = CookieManager.getInstance();
+                for (String cookie : result.cookies) {
+                    cookies.setCookie(url, cookie);
+                }
+                cookies.flush();
+                if (result.rejected) {
+                    Toast.makeText(
+                        this,
+                        "Cloudflare Access rejected the service token “" + token.name + "”",
+                        Toast.LENGTH_LONG
+                    ).show();
+                }
+                if (result.cookies.isEmpty()) {
+                    target.loadUrl(url, AccessCredential.service(token).headers());
+                } else {
+                    target.loadUrl(url);
+                }
+            });
+        }, "AccessServiceToken").start();
+    }
+
+    private boolean isProjectWebViewAlive(WebView target) {
+        if (target == webView) {
+            return true;
+        }
+        for (ProjectSession session : projectSessions.values()) {
+            if (session.webView == target) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * When a project with a service token is sent to the Cloudflare Access
+     * login (its session expired), authenticates again and reloads instead.
+     * At most once per 30 s per page, so a rejected token shows the login.
+     */
+    private boolean reauthorizeInsteadOfAccessLogin(WebView view, Uri url) {
+        if (!ServiceTokenAuth.isAccessLogin(url)) {
+            return false;
+        }
+        String sessionKey = sessionKeyOf(view);
+        if (sessionKey == null || ServiceTokenStore.forProject(this, sessionKey) == null) {
+            return false;
+        }
+        long now = SystemClock.elapsedRealtime();
+        Long last = accessReauthorizedAt.get(view);
+        if (last != null && now - last < 30_000L) {
+            return false;
+        }
+        accessReauthorizedAt.put(view, now);
+        String current = view.getUrl();
+        String destination = current != null && !ServiceTokenAuth.isAccessLogin(Uri.parse(current))
+            ? current
+            : sessionKey;
+        loadProjectUrl(view, destination);
+        return true;
+    }
+
     private boolean isGatewayUrl(String url) {
         return url != null && url.startsWith("http://127.0.0.1:");
     }
@@ -3161,6 +3471,7 @@ public final class MainActivity extends Activity {
         activeSessionKey = sessionKey;
         targetSession.lastInactiveAt = 0L;
         showZoomOf(sessionKey);
+        restoreInputModes(sessionKey);
         webView.setVisibility(View.VISIBLE);
         webView.bringToFront();
         webView.onResume();
@@ -3180,10 +3491,11 @@ public final class MainActivity extends Activity {
             projectSessions.entrySet().iterator();
         while (iterator.hasNext()) {
             Map.Entry<String, ProjectSession> entry = iterator.next();
-            if (entry.getKey().equals(activeSessionKey)) {
+            ProjectSession session = entry.getValue();
+            if (entry.getKey().equals(activeSessionKey) || rdpWebViews.contains(session.webView)) {
+                // Remote desktops stay until they are disconnected.
                 continue;
             }
-            ProjectSession session = entry.getValue();
             if (session.lastInactiveAt > 0L
                 && now - session.lastInactiveAt >= PROJECT_SESSION_TTL_MS) {
                 iterator.remove();
@@ -3242,11 +3554,15 @@ public final class MainActivity extends Activity {
         rdpWebViews.remove(target);
         showBlankWebView();
         destroyWebView(target);
+        applyKeepAliveMode();
         updateAddressBarOverlay();
         rdpPanel.show(address, "Disconnected from the remote desktop.");
     }
 
     private void destroyWebView(WebView target) {
+        if (rdpWebViews.remove(target)) {
+            applyKeepAliveMode();
+        }
         appliedLayoutZoomSteps.remove(target);
         lastFinishedUrls.remove(target);
         if (webContainer != null) {
@@ -3444,9 +3760,22 @@ public final class MainActivity extends Activity {
         }
 
         new AlertDialog.Builder(this)
-            .setTitle(boldText("Tap a project to delete"))
-            .setItems(labels, (dialog, which) -> confirmProjectDeletion(which))
+            .setTitle(boldText("Saved projects"))
+            .setItems(labels, (dialog, which) -> showProjectActions(which))
             .setNegativeButton("Done", null)
+            .show();
+    }
+
+    private void showProjectActions(int index) {
+        ProjectProfile project = projects.get(index);
+        ServiceTokenStore.ServiceToken token = ServiceTokenStore.forProject(this, project.url);
+        new AlertDialog.Builder(this)
+            .setTitle(boldText(project.name))
+            .setMessage(project.url + "\n\nCloudflare Access: "
+                + (token == null ? "browser sign-in" : "service token “" + token.name + "”"))
+            .setPositiveButton("Access token…", (dialog, which) -> chooseProjectServiceToken(project))
+            .setNeutralButton("Delete", (dialog, which) -> confirmProjectDeletion(index))
+            .setNegativeButton("Close", null)
             .show();
     }
 
@@ -3628,7 +3957,8 @@ public final class MainActivity extends Activity {
             return;
         }
         mouseModeEnabled = enabled;
-        preferences.edit().putBoolean(MOUSE_MODE_KEY, enabled).apply();
+        preferences.edit().putBoolean(projectStateKey(MOUSE_MODE_KEY, activeSessionKey), enabled)
+            .apply();
         applyMouseMode();
         Toast.makeText(
             this,
@@ -3679,8 +4009,9 @@ public final class MainActivity extends Activity {
                 + " && typeof window.__codeServerAppKeyboard.setMouseMode === 'function'"
                 + " ? (window.__codeServerAppKeyboard.setKeyboardLocked?.(%b),"
                 + " window.__codeServerAppKeyboard.setMouseMode(%b, %.2f)) : false",
-            keyboardLock == KEYBOARD_LOCKED_HIDDEN,
-            mouseModeEnabled,
+            (target == webView ? keyboardLock : keyboardLockFor(sessionKeyOf(target)))
+                == KEYBOARD_LOCKED_HIDDEN,
+            target == webView ? mouseModeEnabled : mouseModeFor(sessionKeyOf(target)),
             widthDp
         );
         target.evaluateJavascript(script, null);
@@ -3843,6 +4174,11 @@ public final class MainActivity extends Activity {
         if (!keepAliveEnabled) {
             boolean activeViewIsCached = activeSessionKey != null;
             for (ProjectSession session : projectSessions.values()) {
+                // Remote desktops keep running in the background (see
+                // applyKeepAliveMode); pausing them would drop the session.
+                if (rdpWebViews.contains(session.webView)) {
+                    continue;
+                }
                 session.webView.onPause();
             }
             if (!activeViewIsCached && webView != null) {

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 11 and lower. Cloudflare Access credentials are encrypted with a
+     device-bound Keystore key and must not be backed up or restored. -->
+<full-backup-content>
+    <exclude domain="sharedpref" path="cloudflare_access.xml" />
+</full-backup-content>

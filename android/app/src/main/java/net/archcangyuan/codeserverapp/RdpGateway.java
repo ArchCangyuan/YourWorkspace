@@ -22,7 +22,11 @@ import java.util.Base64;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLHandshakeException;
@@ -48,11 +52,11 @@ final class RdpGateway {
     interface Environment {
         InputStream openAsset(String name) throws IOException;
 
-        String loadToken(String host);
+        AccessCredential loadCredential(String host);
 
         void clearToken(String host);
 
-        AccessWebSocket openTunnel(String host, String token) throws IOException;
+        AccessWebSocket openTunnel(String host, AccessCredential credential) throws IOException;
     }
 
     private static final String ASSET_DIRECTORY = "rdp/";
@@ -66,6 +70,17 @@ final class RdpGateway {
     private final Map<String, String> sessionErrors = new ConcurrentHashMap<>();
     private final java.util.Set<String> rsaKeyExchangeHosts = ConcurrentHashMap.newKeySet();
     private final SecureRandom random = new SecureRandom();
+    // Cloudflare closes idle WebSockets after about 100 s; an idle or
+    // backgrounded remote desktop sends nothing, so the tunnels are pinged.
+    private static final long TUNNEL_PING_SECONDS = 20L;
+    private final Set<AccessWebSocket> openTunnels = ConcurrentHashMap.newKeySet();
+    private final ScheduledExecutorService pinger = Executors.newSingleThreadScheduledExecutor(
+        runnable -> {
+            Thread thread = new Thread(runnable, "RdpGateway-ping");
+            thread.setDaemon(true);
+            return thread;
+        }
+    );
     private volatile Listener listener;
 
     RdpGateway(Environment environment) throws IOException {
@@ -76,6 +91,15 @@ final class RdpGateway {
         Thread acceptThread = new Thread(this::acceptLoop, "RdpGateway-accept");
         acceptThread.setDaemon(true);
         acceptThread.start();
+        pinger.scheduleWithFixedDelay(() -> {
+            for (AccessWebSocket tunnel : openTunnels) {
+                try {
+                    tunnel.sendPing();
+                } catch (IOException ignored) {
+                    // The relay notices the broken tunnel and ends the session.
+                }
+            }
+        }, TUNNEL_PING_SECONDS, TUNNEL_PING_SECONDS, TimeUnit.SECONDS);
     }
 
     static synchronized RdpGateway get(Context context) throws IOException {
@@ -89,8 +113,8 @@ final class RdpGateway {
                 }
 
                 @Override
-                public String loadToken(String host) {
-                    return AccessTokenStore.loadToken(appContext, host);
+                public AccessCredential loadCredential(String host) {
+                    return AccessTokenStore.credential(appContext, host);
                 }
 
                 @Override
@@ -99,8 +123,9 @@ final class RdpGateway {
                 }
 
                 @Override
-                public AccessWebSocket openTunnel(String host, String token) throws IOException {
-                    return AccessWebSocket.connect(host, token);
+                public AccessWebSocket openTunnel(String host, AccessCredential credential)
+                    throws IOException {
+                    return AccessWebSocket.connect(host, credential);
                 }
             });
         }
@@ -109,6 +134,7 @@ final class RdpGateway {
 
     void close() {
         closeQuietly(server);
+        pinger.shutdownNow();
     }
 
     void setListener(Listener listener) {
@@ -261,7 +287,7 @@ final class RdpGateway {
     }
 
     /** The tunnel, X.224 response and TLS connection to one RDP server. */
-    private static final class ServerLink implements java.io.Closeable {
+    private final class ServerLink implements java.io.Closeable {
         AccessWebSocket tunnel;
         Socket[] pair;
         SSLSocket tls;
@@ -277,6 +303,7 @@ final class RdpGateway {
                 closeQuietly(pair[1]);
             }
             if (tunnel != null) {
+                openTunnels.remove(tunnel);
                 tunnel.close();
             }
         }
@@ -299,7 +326,7 @@ final class RdpGateway {
             sessionToken = request.proxyAuth;
             setStage(sessionToken, "tunnel");
             setError(sessionToken, null);
-            String token = environment.loadToken(host);
+            AccessCredential token = environment.loadCredential(host);
             if (token == null) {
                 setError(sessionToken, "Cloudflare sign-in required");
                 notifyLoginRequired(host);
@@ -360,7 +387,7 @@ final class RdpGateway {
         AccessWebSocket client,
         String sessionToken,
         String host,
-        String token,
+        AccessCredential token,
         RdCleanPath.Request request,
         boolean rsaKeyExchange
     ) throws Exception {
@@ -370,7 +397,15 @@ final class RdpGateway {
             setStage(sessionToken, "tunnel");
             try {
                 link.tunnel = environment.openTunnel(host, token);
+                openTunnels.add(link.tunnel);
             } catch (AccessWebSocket.LoginRequiredException exception) {
+                if (token.isServiceToken()) {
+                    // Signing in again would not help; report the token instead.
+                    setError(sessionToken, "Cloudflare Access rejected the service token "
+                        + "“" + token.serviceToken.name + "”");
+                    sendPdu(client, RdCleanPath.encodeGeneralError(403));
+                    throw new ReportedException();
+                }
                 setError(sessionToken, "Cloudflare sign-in required");
                 environment.clearToken(host);
                 notifyLoginRequired(host);
