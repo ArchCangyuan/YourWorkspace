@@ -3870,10 +3870,8 @@ public final class MainActivity extends Activity {
             empty.setPadding(dp(4), dp(8), dp(4), dp(12));
             list.addView(empty);
         }
-        for (int index = 0; index < projects.size(); index++) {
-            ProjectProfile project = projects.get(index);
-            int projectIndex = index;
-            list.addView(projectCard(
+        for (ProjectProfile project : projects) {
+            View card = projectCard(
                 project,
                 isProjectSessionHot(project.url, now),
                 () -> {
@@ -3882,9 +3880,11 @@ public final class MainActivity extends Activity {
                 },
                 () -> {
                     dialog.dismiss();
-                    showProjectEditor(projectIndex, null);
+                    showProjectEditor(projects.indexOf(project), null);
                 }
-            ));
+            );
+            card.setTag(project);
+            list.addView(card);
         }
 
         saveCurrent.setOnClickListener(view -> {
@@ -3912,7 +3912,7 @@ public final class MainActivity extends Activity {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.HORIZONTAL);
         card.setGravity(Gravity.CENTER_VERTICAL);
-        card.setPadding(dp(14), dp(10), dp(6), dp(10));
+        card.setPadding(dp(4), dp(10), dp(6), dp(10));
         GradientDrawable shape = new GradientDrawable();
         shape.setColor(Color.rgb(245, 245, 248));
         shape.setCornerRadius(dp(12));
@@ -3922,6 +3922,15 @@ public final class MainActivity extends Activity {
             null
         ));
         card.setOnClickListener(view -> open.run());
+
+        TextView handle = new TextView(this);
+        handle.setText("≡");
+        handle.setTextSize(20);
+        handle.setTextColor(Color.rgb(150, 150, 155));
+        handle.setGravity(Gravity.CENTER);
+        handle.setContentDescription("Drag to reorder " + project.name);
+        handle.setOnTouchListener(this::dragProjectCard);
+        card.addView(handle, new LinearLayout.LayoutParams(dp(28), dp(40)));
 
         LinearLayout text = new LinearLayout(this);
         text.setOrientation(LinearLayout.VERTICAL);
@@ -3976,6 +3985,69 @@ public final class MainActivity extends Activity {
         params.bottomMargin = dp(8);
         card.setLayoutParams(params);
         return card;
+    }
+
+    private float projectDragLastY;
+
+    /**
+     * Drag handle of a project card: the card follows the finger, neighbours
+     * move past it, and the new order is saved when the finger lifts.
+     */
+    private boolean dragProjectCard(View handle, MotionEvent event) {
+        View card = (View) handle.getParent();
+        LinearLayout list = (LinearLayout) card.getParent();
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                projectDragLastY = event.getRawY();
+                card.setElevation(dp(6));
+                list.getParent().requestDisallowInterceptTouchEvent(true);
+                return true;
+            case MotionEvent.ACTION_MOVE: {
+                float offset = card.getTranslationY() + event.getRawY() - projectDragLastY;
+                projectDragLastY = event.getRawY();
+                int index = list.indexOfChild(card);
+                int gap = dp(8);
+                if (offset > 0 && index < list.getChildCount() - 1) {
+                    View next = list.getChildAt(index + 1);
+                    if (offset > (next.getHeight() + gap) / 2f) {
+                        // Move the neighbour above instead of the dragged card,
+                        // which keeps receiving this touch.
+                        list.removeView(next);
+                        list.addView(next, index);
+                        offset -= next.getHeight() + gap;
+                    }
+                } else if (offset < 0 && index > 0) {
+                    View previous = list.getChildAt(index - 1);
+                    if (-offset > (previous.getHeight() + gap) / 2f) {
+                        list.removeView(previous);
+                        list.addView(previous, index);
+                        offset += previous.getHeight() + gap;
+                    }
+                }
+                card.setTranslationY(offset);
+                return true;
+            }
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_CANCEL:
+                card.animate().translationY(0f).setDuration(120).start();
+                card.setElevation(0f);
+                list.getParent().requestDisallowInterceptTouchEvent(false);
+                List<ProjectProfile> ordered = new ArrayList<>();
+                for (int position = 0; position < list.getChildCount(); position++) {
+                    Object tag = list.getChildAt(position).getTag();
+                    if (tag instanceof ProjectProfile) {
+                        ordered.add((ProjectProfile) tag);
+                    }
+                }
+                if (ordered.size() == projects.size() && !ordered.equals(projects)) {
+                    projects.clear();
+                    projects.addAll(ordered);
+                    persistProjects();
+                }
+                return true;
+            default:
+                return false;
+        }
     }
 
     private Button pillButton(String label, boolean primary) {
