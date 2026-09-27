@@ -50,13 +50,16 @@ import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.SeekBar;
+import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -106,6 +109,8 @@ public final class MainActivity extends Activity {
     private static final int KEY_BACKGROUND = Color.rgb(230, 230, 234);
     /** Height of the key bar's keys; the bar adds 3 dp above and below. */
     private static final int KEY_HEIGHT_DP = 32;
+    /** Height of the address bar, without the top cutout inset. */
+    private static final int ADDRESS_BAR_HEIGHT_DP = 44;
     private static final String DESKTOP_USER_AGENT =
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
             + "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -2040,7 +2045,7 @@ public final class MainActivity extends Activity {
         addressBar = new LinearLayout(this);
         addressBar.setOrientation(LinearLayout.HORIZONTAL);
         addressBar.setGravity(Gravity.CENTER_VERTICAL);
-        addressBar.setPadding(dp(8), dp(5), dp(8), dp(5));
+        addressBar.setPadding(dp(6), dp(4), dp(6), dp(4));
         addressBar.setBackgroundColor(Color.rgb(243, 243, 243));
 
         Button projectsButton = createToolbarButton("☰");
@@ -2051,6 +2056,14 @@ public final class MainActivity extends Activity {
         addressField = new EditText(this);
         addressField.setSingleLine(true);
         addressField.setTextSize(14);
+        addressField.setMinHeight(0);
+        addressField.setMinimumHeight(0);
+        addressField.setPadding(dp(12), 0, dp(12), 0);
+        GradientDrawable fieldBackground = new GradientDrawable();
+        fieldBackground.setColor(Color.WHITE);
+        fieldBackground.setCornerRadius(dp(10));
+        fieldBackground.setStroke(Math.max(1, dp(1) / 2), Color.argb(30, 0, 0, 0));
+        addressField.setBackground(fieldBackground);
         addressField.setHint("https://… or rdp://host");
         addressField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         addressField.setImeOptions(EditorInfo.IME_ACTION_GO);
@@ -2071,10 +2084,10 @@ public final class MainActivity extends Activity {
             }
             return false;
         });
-        addressBar.addView(
-            addressField,
-            new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
-        );
+        LinearLayout.LayoutParams fieldParams =
+            new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f);
+        fieldParams.setMargins(dp(4), 0, dp(4), 0);
+        addressBar.addView(addressField, fieldParams);
 
         Button reloadButton = createToolbarButton("↻");
         reloadButton.setContentDescription("Reload code-server");
@@ -2107,7 +2120,7 @@ public final class MainActivity extends Activity {
             addressBar,
             new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(56)
+                dp(ADDRESS_BAR_HEIGHT_DP)
             )
         );
         // Raised so it can float above a remote desktop (see updateAddressBarOverlay).
@@ -2439,46 +2452,6 @@ public final class MainActivity extends Activity {
                 showServiceTokenManager();
             }));
         dialog.show();
-    }
-
-    /** Chooses whether a project uses a service token, and which one. */
-    private void chooseProjectServiceToken(ProjectProfile project) {
-        List<ServiceTokenStore.ServiceToken> tokens = ServiceTokenStore.list(this);
-        if (tokens.isEmpty()) {
-            Toast.makeText(
-                this,
-                "Add a token first: Settings → Cloudflare Access service tokens",
-                Toast.LENGTH_LONG
-            ).show();
-            return;
-        }
-        String current = ServiceTokenStore.projectTokenId(this, project.url);
-        CharSequence[] labels = new CharSequence[tokens.size() + 1];
-        labels[0] = "None (browser sign-in)";
-        int checked = 0;
-        for (int index = 0; index < tokens.size(); index++) {
-            labels[index + 1] = tokens.get(index).name;
-            if (tokens.get(index).id.equals(current)) {
-                checked = index + 1;
-            }
-        }
-        new AlertDialog.Builder(this)
-            .setTitle(boldText("Cloudflare Access for " + project.name))
-            .setSingleChoiceItems(labels, checked, (dialog, which) -> {
-                ServiceTokenStore.setForProject(
-                    this,
-                    project.url,
-                    which == 0 ? null : tokens.get(which - 1).id
-                );
-                dialog.dismiss();
-                Toast.makeText(
-                    this,
-                    "Applies the next time " + project.name + " loads",
-                    Toast.LENGTH_SHORT
-                ).show();
-            })
-            .setNegativeButton("Cancel", null)
-            .show();
     }
 
     private void setKeepAliveEnabled(boolean enabled) {
@@ -2937,10 +2910,10 @@ public final class MainActivity extends Activity {
         if (addressBar == null) {
             return;
         }
-        addressBar.setPadding(dp(8), dp(5) + topInset, dp(8), dp(5));
+        addressBar.setPadding(dp(6), dp(4) + topInset, dp(6), dp(4));
         ViewGroup.LayoutParams params = addressBar.getLayoutParams();
-        if (params != null && params.height != dp(56) + topInset) {
-            params.height = dp(56) + topInset;
+        if (params != null && params.height != dp(ADDRESS_BAR_HEIGHT_DP) + topInset) {
+            params.height = dp(ADDRESS_BAR_HEIGHT_DP) + topInset;
             addressBar.setLayoutParams(params);
             updateAddressBarOverlay();
         }
@@ -3791,7 +3764,7 @@ public final class MainActivity extends Activity {
             && webView != null
             && rdpWebViews.contains(webView);
         ViewGroup.LayoutParams barParams = addressBar.getLayoutParams();
-        int barHeight = barParams != null && barParams.height > 0 ? barParams.height : dp(56);
+        int barHeight = barParams != null && barParams.height > 0 ? barParams.height : dp(ADDRESS_BAR_HEIGHT_DP);
         LinearLayout.LayoutParams frameParams =
             (LinearLayout.LayoutParams) contentFrame.getLayoutParams();
         int frameMargin = overlay ? -barHeight : 0;
@@ -3845,101 +3818,310 @@ public final class MainActivity extends Activity {
         preferences.edit().putString(PROJECTS_KEY, array.toString()).apply();
     }
 
+    /** Saved projects as cards: tap to open, ✎ to edit; new and save-current on top. */
     private void showProjectSwitcher() {
         long now = SystemClock.elapsedRealtime();
         cleanupExpiredProjectSessions(now);
 
-        List<CharSequence> choices = new ArrayList<>();
-        choices.add("+ Save current address");
-        for (ProjectProfile project : projects) {
-            choices.add(styledProjectLabel(project, false, isProjectSessionHot(project.url, now)));
-        }
-        choices.add("Manage saved projects");
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(dp(16), dp(14), dp(16), dp(8));
 
-        new AlertDialog.Builder(this)
-            .setTitle(boldText("Projects"))
-            .setItems(choices.toArray(new CharSequence[0]), (dialog, which) -> {
-                if (which == 0) {
-                    saveCurrentAsProject();
-                } else if (which <= projects.size()) {
-                    openProject(projects.get(which - 1));
-                } else {
-                    showProjectManager();
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        TextView title = new TextView(this);
+        title.setText("Projects");
+        title.setTextSize(20);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        title.setTextColor(Color.rgb(28, 28, 30));
+        header.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        Button saveCurrent = pillButton("Save current", false);
+        Button addNew = pillButton("＋ New", true);
+        header.addView(saveCurrent);
+        LinearLayout.LayoutParams addParams = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        addParams.setMarginStart(dp(8));
+        header.addView(addNew, addParams);
+        content.addView(header);
+
+        LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        list.setPadding(0, dp(12), 0, 0);
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(list);
+        content.addView(scroll, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+            .setView(content)
+            .setNegativeButton("Close", null)
+            .create();
+
+        if (projects.isEmpty()) {
+            TextView empty = new TextView(this);
+            empty.setText("No saved projects yet. Add one, or save the current address.");
+            empty.setTextSize(14);
+            empty.setTextColor(Color.rgb(110, 110, 115));
+            empty.setPadding(dp(4), dp(8), dp(4), dp(12));
+            list.addView(empty);
+        }
+        for (int index = 0; index < projects.size(); index++) {
+            ProjectProfile project = projects.get(index);
+            int projectIndex = index;
+            list.addView(projectCard(
+                project,
+                isProjectSessionHot(project.url, now),
+                () -> {
+                    dialog.dismiss();
+                    openProject(project);
+                },
+                () -> {
+                    dialog.dismiss();
+                    showProjectEditor(projectIndex, null);
                 }
-            })
-            .setNegativeButton("Cancel", null)
-            .show();
+            ));
+        }
+
+        saveCurrent.setOnClickListener(view -> {
+            String url = normalizeAddress(addressField.getText().toString());
+            if (url.isEmpty()) {
+                Toast.makeText(this, "Enter an address first", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            dialog.dismiss();
+            showProjectEditor(-1, url);
+        });
+        addNew.setOnClickListener(view -> {
+            dialog.dismiss();
+            showProjectEditor(-1, "");
+        });
+        dialog.show();
     }
 
-    private void saveCurrentAsProject() {
-        String url = normalizeAddress(addressField.getText().toString());
-        if (url.isEmpty()) {
-            Toast.makeText(this, "Enter an address first", Toast.LENGTH_SHORT).show();
-            return;
+    private View projectCard(
+        ProjectProfile project,
+        boolean hot,
+        Runnable open,
+        Runnable edit
+    ) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.HORIZONTAL);
+        card.setGravity(Gravity.CENTER_VERTICAL);
+        card.setPadding(dp(14), dp(10), dp(6), dp(10));
+        GradientDrawable shape = new GradientDrawable();
+        shape.setColor(Color.rgb(245, 245, 248));
+        shape.setCornerRadius(dp(12));
+        card.setBackground(new RippleDrawable(
+            ColorStateList.valueOf(Color.argb(30, 0, 0, 0)),
+            shape,
+            null
+        ));
+        card.setOnClickListener(view -> open.run());
+
+        LinearLayout text = new LinearLayout(this);
+        text.setOrientation(LinearLayout.VERTICAL);
+        TextView name = new TextView(this);
+        name.setText(project.name);
+        name.setTextSize(16);
+        name.setTypeface(Typeface.DEFAULT_BOLD);
+        name.setTextColor(Color.rgb(28, 28, 30));
+        name.setSingleLine(true);
+        name.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        text.addView(name);
+        TextView address = new TextView(this);
+        address.setText(project.url);
+        address.setTextSize(12);
+        address.setTextColor(Color.rgb(110, 110, 115));
+        address.setSingleLine(true);
+        address.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
+        text.addView(address);
+
+        List<String> tags = new ArrayList<>();
+        if (RdpConnectionPanel.isRdpAddress(project.url)) {
+            tags.add("RDP");
         }
+        ServiceTokenStore.ServiceToken token = ServiceTokenStore.forProject(this, project.url);
+        if (token != null) {
+            tags.add("🔑 " + token.name);
+        }
+        if (hot) {
+            tags.add("● Open");
+        }
+        if (!tags.isEmpty()) {
+            TextView tagView = new TextView(this);
+            tagView.setText(String.join("  ·  ", tags));
+            tagView.setTextSize(11);
+            tagView.setTextColor(ACCENT);
+            tagView.setPadding(0, dp(3), 0, 0);
+            tagView.setSingleLine(true);
+            tagView.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            text.addView(tagView);
+        }
+        card.addView(text, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        Button editButton = createToolbarButton("✎");
+        editButton.setContentDescription("Edit " + project.name);
+        editButton.setOnClickListener(view -> edit.run());
+        card.addView(editButton, new LinearLayout.LayoutParams(dp(40), dp(40)));
+
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        params.bottomMargin = dp(8);
+        card.setLayoutParams(params);
+        return card;
+    }
+
+    private Button pillButton(String label, boolean primary) {
+        Button button = new Button(this);
+        button.setText(label);
+        button.setAllCaps(false);
+        button.setTextSize(13);
+        button.setMinHeight(0);
+        button.setMinimumHeight(0);
+        button.setMinWidth(0);
+        button.setMinimumWidth(0);
+        button.setPadding(dp(12), dp(6), dp(12), dp(6));
+        button.setStateListAnimator(null);
+        button.setTextColor(primary ? Color.WHITE : ACCENT);
+        GradientDrawable shape = new GradientDrawable();
+        shape.setCornerRadius(dp(16));
+        shape.setColor(primary ? ACCENT : Color.TRANSPARENT);
+        if (!primary) {
+            shape.setStroke(Math.max(1, dp(1)), ACCENT);
+        }
+        button.setBackground(new RippleDrawable(
+            ColorStateList.valueOf(Color.argb(40, 0, 0, 0)),
+            shape,
+            null
+        ));
+        return button;
+    }
+
+    /**
+     * Adds a project ({@code index} < 0, with {@code presetUrl} prefilled, e.g.
+     * the current address) or edits one: name, address and Cloudflare Access
+     * (browser sign-in or a saved service token).
+     */
+    private void showProjectEditor(int index, String presetUrl) {
+        ProjectProfile existing = index >= 0 ? projects.get(index) : null;
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(dp(20), dp(8), dp(20), 0);
 
         EditText nameField = new EditText(this);
         nameField.setSingleLine(true);
-        nameField.setHint("Project name");
-        nameField.setText("Project " + (projects.size() + 1));
-        nameField.selectAll();
+        nameField.setHint("Name");
+        EditText urlField = new EditText(this);
+        urlField.setSingleLine(true);
+        urlField.setHint("https://… or rdp://host");
+        urlField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        String initialUrl = existing != null ? existing.url : (presetUrl == null ? "" : presetUrl);
+        nameField.setText(existing != null
+            ? existing.name
+            : (initialUrl.isEmpty() ? "" : suggestedProjectName(initialUrl)));
+        urlField.setText(initialUrl);
+        form.addView(formLabel("Name"));
+        form.addView(nameField);
+        form.addView(formLabel("Address"));
+        form.addView(urlField);
 
-        new AlertDialog.Builder(this)
-            .setTitle(boldText("Save project"))
-            .setMessage(url)
-            .setView(nameField)
-            .setPositiveButton("Save", (dialog, which) -> {
+        List<ServiceTokenStore.ServiceToken> tokens = ServiceTokenStore.list(this);
+        List<String> choices = new ArrayList<>();
+        choices.add("Browser sign-in");
+        for (ServiceTokenStore.ServiceToken token : tokens) {
+            choices.add("Service token: " + token.name);
+        }
+        Spinner accessChoice = new Spinner(this);
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(
+            this,
+            android.R.layout.simple_spinner_dropdown_item,
+            choices
+        );
+        accessChoice.setAdapter(adapter);
+        String currentTokenId = initialUrl.isEmpty()
+            ? null
+            : ServiceTokenStore.projectTokenId(this, initialUrl);
+        for (int position = 0; position < tokens.size(); position++) {
+            if (tokens.get(position).id.equals(currentTokenId)) {
+                accessChoice.setSelection(position + 1);
+            }
+        }
+        form.addView(formLabel("Cloudflare Access"));
+        form.addView(accessChoice);
+        if (tokens.isEmpty()) {
+            TextView hint = new TextView(this);
+            hint.setText("Service tokens are added in Settings → Cloudflare Access service tokens.");
+            hint.setTextSize(12);
+            hint.setTextColor(Color.rgb(110, 110, 115));
+            form.addView(hint);
+        }
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(this)
+            .setTitle(boldText(existing != null ? "Edit project" : "New project"))
+            .setView(form)
+            .setPositiveButton("Save", null)
+            .setNegativeButton("Cancel", null);
+        if (existing != null) {
+            builder.setNeutralButton("Delete", (dialog, which) -> confirmProjectDeletion(index));
+        }
+        AlertDialog dialog = builder.create();
+        dialog.setOnShowListener(shown -> dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+            .setOnClickListener(view -> {
+                String url = normalizeAddress(urlField.getText().toString());
+                if (url.isEmpty()) {
+                    Toast.makeText(this, "Enter an address", Toast.LENGTH_SHORT).show();
+                    return;
+                }
                 String name = nameField.getText().toString().trim();
                 if (name.isEmpty()) {
-                    name = "Project " + (projects.size() + 1);
+                    name = suggestedProjectName(url);
                 }
-                projects.add(new ProjectProfile(name, url));
+                ProjectProfile saved = new ProjectProfile(name, url);
+                if (existing != null) {
+                    projects.set(index, saved);
+                } else {
+                    projects.add(saved);
+                }
                 persistProjects();
-            })
-            .setNegativeButton("Cancel", null)
-            .show();
+                int selected = accessChoice.getSelectedItemPosition();
+                ServiceTokenStore.setForProject(
+                    this,
+                    url,
+                    selected <= 0 ? null : tokens.get(selected - 1).id
+                );
+                dialog.dismiss();
+                showProjectSwitcher();
+            }));
+        dialog.show();
+    }
+
+    private TextView formLabel(String text) {
+        TextView label = new TextView(this);
+        label.setText(text);
+        label.setTextSize(12);
+        label.setTextColor(Color.rgb(110, 110, 115));
+        label.setPadding(dp(4), dp(10), 0, 0);
+        return label;
+    }
+
+    /** A readable default name: the host of the address. */
+    private static String suggestedProjectName(String url) {
+        if (RdpConnectionPanel.isRdpAddress(url)) {
+            return RdpConnectionPanel.hostOf(url);
+        }
+        String host = Uri.parse(url).getHost();
+        return host == null || host.isEmpty() ? url : host;
     }
 
     private void openProject(ProjectProfile project) {
         switchToProjectUrl(project.url);
-    }
-
-    private void showProjectManager() {
-        if (projects.isEmpty()) {
-            Toast.makeText(this, "No saved projects", Toast.LENGTH_SHORT).show();
-            return;
-        }
-
-        long now = SystemClock.elapsedRealtime();
-        cleanupExpiredProjectSessions(now);
-        CharSequence[] labels = new CharSequence[projects.size()];
-        for (int index = 0; index < projects.size(); index++) {
-            ProjectProfile project = projects.get(index);
-            labels[index] = styledProjectLabel(
-                project,
-                true,
-                isProjectSessionHot(project.url, now)
-            );
-        }
-
-        new AlertDialog.Builder(this)
-            .setTitle(boldText("Saved projects"))
-            .setItems(labels, (dialog, which) -> showProjectActions(which))
-            .setNegativeButton("Done", null)
-            .show();
-    }
-
-    private void showProjectActions(int index) {
-        ProjectProfile project = projects.get(index);
-        ServiceTokenStore.ServiceToken token = ServiceTokenStore.forProject(this, project.url);
-        new AlertDialog.Builder(this)
-            .setTitle(boldText(project.name))
-            .setMessage(project.url + "\n\nCloudflare Access: "
-                + (token == null ? "browser sign-in" : "service token “" + token.name + "”"))
-            .setPositiveButton("Access token…", (dialog, which) -> chooseProjectServiceToken(project))
-            .setNeutralButton("Delete", (dialog, which) -> confirmProjectDeletion(index))
-            .setNegativeButton("Close", null)
-            .show();
     }
 
     private void confirmProjectDeletion(int index) {
@@ -3950,6 +4132,7 @@ public final class MainActivity extends Activity {
             .setPositiveButton("Delete", (dialog, which) -> {
                 projects.remove(index);
                 persistProjects();
+                showProjectSwitcher();
             })
             .setNegativeButton("Cancel", null)
             .show();
@@ -3961,24 +4144,6 @@ public final class MainActivity extends Activity {
             new StyleSpan(Typeface.BOLD),
             0,
             text.length(),
-            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-        );
-        return styled;
-    }
-
-    private static CharSequence styledProjectLabel(
-        ProjectProfile project,
-        boolean includeUrl,
-        boolean hot
-    ) {
-        String suffix = (RdpConnectionPanel.isRdpAddress(project.url) ? "  • RDP" : "")
-            + (hot ? "  • HOT" : "");
-        String text = project.name + suffix + (includeUrl ? "\n" + project.url : "");
-        SpannableString styled = new SpannableString(text);
-        styled.setSpan(
-            new StyleSpan(Typeface.BOLD),
-            0,
-            project.name.length(),
             Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
         );
         return styled;
@@ -4257,14 +4422,30 @@ public final class MainActivity extends Activity {
         row.addView(button, keyLayoutParams(width));
     }
 
+    /** A flat icon button for the address bar. */
     private Button createToolbarButton(String label) {
         Button button = new Button(this);
         button.setText(label);
-        button.setTextSize(13);
+        button.setTextSize(17);
+        button.setTextColor(Color.rgb(40, 40, 40));
         button.setAllCaps(false);
-        button.setMinWidth(0);
-        button.setMinimumWidth(0);
-        button.setPadding(dp(10), 0, dp(10), 0);
+        button.setMinWidth(dp(36));
+        button.setMinimumWidth(dp(36));
+        button.setMinHeight(0);
+        button.setMinimumHeight(0);
+        button.setPadding(dp(6), 0, dp(6), 0);
+        button.setStateListAnimator(null);
+        GradientDrawable shape = new GradientDrawable();
+        shape.setColor(Color.TRANSPARENT);
+        shape.setCornerRadius(dp(8));
+        GradientDrawable mask = new GradientDrawable();
+        mask.setColor(Color.WHITE);
+        mask.setCornerRadius(dp(8));
+        button.setBackground(new RippleDrawable(
+            ColorStateList.valueOf(Color.argb(40, 0, 0, 0)),
+            shape,
+            mask
+        ));
         return button;
     }
 
