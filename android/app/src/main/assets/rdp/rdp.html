@@ -85,9 +85,21 @@
     white-space: nowrap;
   }
   .transfer .state {
+    flex: 0 1 auto;
+    max-width: 45%;
+    overflow: hidden;
+    text-overflow: ellipsis;
     color: #666;
     font-size: 12px;
     white-space: nowrap;
+  }
+  .transfer header span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .transfer button {
+    flex: none;
   }
   .transfer button {
     border: 0;
@@ -559,10 +571,15 @@
       const blob = await completion;
       row.state.textContent = 'Saving…';
       const savedAs = await saveToDevice(file.name, blob);
-      row.state.textContent = `Saved to ${savedAs}`;
+      // Short status in the row; the app's toast names the saved location.
+      row.state.textContent = 'Saved ✓';
+      row.state.title = savedAs;
+      row.button.textContent = 'Again';
+      row.button.disabled = false;
       notifyNative('file_saved', savedAs);
     } catch (error) {
-      row.state.textContent = `Failed: ${String(error?.message || error).slice(0, 80)}`;
+      row.state.textContent = 'Failed';
+      row.state.title = String(error?.message || error);
       row.button.disabled = false;
     }
   };

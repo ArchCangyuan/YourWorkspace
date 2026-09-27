@@ -145,7 +145,7 @@ private let keyboardBridgeSource = #"""
   window.__codeServerAppIsRdpPage = () => Boolean(findIronRdpCanvas());
 
   const existingBridge = window.__codeServerAppKeyboard;
-  if (existingBridge && existingBridge.version >= 16) {
+  if (existingBridge && existingBridge.version >= 17) {
     window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
     existingBridge.installRdpGestures?.();
     existingBridge.installDesktopGestures?.();
@@ -598,9 +598,28 @@ private let keyboardBridgeSource = #"""
     if (!isGeneric || !state.target) state.target = candidate;
   };
 
+  // IronRDP only takes keys while its canvas has focus; a tap elsewhere
+  // (e.g. a file bar button) moves it away, so restore it before typing.
+  const focusedIronRdpCanvas = (canvas) => {
+    const host = canvas.getRootNode?.()?.host;
+    if (host && document.activeElement !== host) {
+      canvas.focus({ preventScroll: true });
+    }
+    return canvas;
+  };
+
   const activeTarget = () => {
     if (state.ironRdpCanvas && state.ironRdpCanvas.isConnected) {
-      return state.ironRdpCanvas;
+      return focusedIronRdpCanvas(state.ironRdpCanvas);
+    }
+    // On the built-in remote desktop page all typing belongs to the
+    // remote desktop, even before KB was pressed.
+    if (window.__yourWorkspaceRdpPage) {
+      const canvas = findIronRdpCanvas();
+      if (canvas) {
+        state.ironRdpCanvas = canvas;
+        return focusedIronRdpCanvas(canvas);
+      }
     }
     const current = deepestActiveElement(document);
     if (current) {
@@ -1586,7 +1605,7 @@ private let keyboardBridgeSource = #"""
   };
 
   const bridge = {
-    version: 16,
+    version: 17,
     forceKeyboard() {
       installRdpGestures();
       const canvas = findIronRdpCanvas();
