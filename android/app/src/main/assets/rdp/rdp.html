@@ -223,9 +223,15 @@
       const read = nativeBridge.clipboardText();
       // null: the clipboard cannot be read right now (the app is in the
       // background); keep reporting the last content so nothing looks copied.
-      if (read === null || read === undefined) return lastClipboardText ?? '';
+      if (read === null || read === undefined) {
+        // Nothing known yet: fail the read (IronRDP skips it) rather than
+        // report an empty clipboard.
+        if (lastClipboardText === null) throw new Error('clipboard not readable yet');
+        return lastClipboardText;
+      }
       const text = read;
       if (lastClipboardText !== null && text !== lastClipboardText) {
+        console.info(`clipboard: phone clipboard changed (${text.length} chars)`);
         window.dispatchEvent(new Event('yourworkspace-clipboard-replaced'));
       }
       lastClipboardText = text;
@@ -763,6 +769,25 @@
   };
   // IronRDP keeps an upload pending until Windows has read every file, and
   // refuses new uploads meanwhile. A new pick replaces a pending one.
+  // IronRDP polls the phone clipboard and sends any change to the PC, which
+  // would replace uploaded files there. It suspends that only while the file
+  // list is being sent; hold it until Windows has read the files instead.
+  const clipboardHold = { suppress: null, resume: null, held: false, timer: 0 };
+  const holdClipboard = () => {
+    if (!clipboardHold.suppress) return;
+    clipboardHold.suppress();
+    clipboardHold.held = true;
+    window.clearTimeout(clipboardHold.timer);
+    clipboardHold.timer = window.setTimeout(releaseClipboard, 10 * 60 * 1000);
+    console.info('clipboard: sync from the phone paused until the files are pasted');
+  };
+  const releaseClipboard = () => {
+    window.clearTimeout(clipboardHold.timer);
+    if (!clipboardHold.held) return;
+    clipboardHold.held = false;
+    clipboardHold.resume?.();
+    console.info('clipboard: sync from the phone resumed');
+  };
   const abandonPendingUpload = () => {
     const state = fileTransfer.uploadState;
     if (state === undefined) return;
@@ -773,6 +798,7 @@
     fileTransfer.uploadState = undefined;
     fileTransfer.retainedFiles = undefined;
     try { state.resolve?.(); } catch (error) { /* ignore */ }
+    releaseClipboard();
   };
   const updateUploadTitle = () => {
     if (!upload) return;
@@ -798,6 +824,7 @@
       return;
     }
     upload.paste.hidden = true;
+    releaseClipboard();
     if (failed) {
       upload.title.textContent = failed === rows.length
         ? 'Upload failed'
@@ -832,6 +859,7 @@
     close.addEventListener('click', () => {
       window.clearTimeout(uploadHideTimer);
       uploadsElement.hidden = true;
+      releaseClipboard();
     });
     const logButton = document.createElement('button');
     logButton.className = 'plain small';
@@ -916,6 +944,7 @@
     }
     try {
       const { transferIds, completion } = fileTransfer.uploadFiles(files);
+      holdClipboard();
       for (const [fileIndex, transferId] of transferIds || []) {
         current.byTransferId.set(transferId, pickedRows[fileIndex]);
       }
@@ -927,6 +956,7 @@
         updateUploadTitle();
       });
     } catch (error) {
+      clipboardHold.resume?.();
       const reason = lastClipboardWarning || String(error?.message || error);
       for (const row of pickedRows) failRow(row, reason.slice(0, 120));
       current.title.textContent = 'Could not put the files on the remote clipboard';
@@ -1013,6 +1043,11 @@
     ui.setEnableClipboard(true);
     ui.setEnableAutoClipboard(true);
     ui.enableFileTransfer(fileTransfer);
+    // enableFileTransfer wires these to pause/resume clipboard monitoring
+    // around sending the file list; the page holds the pause itself.
+    clipboardHold.suppress = fileTransfer.onUploadStarted;
+    clipboardHold.resume = fileTransfer.onUploadFinished;
+    fileTransfer.onUploadFinished = () => {};
     // Characters without a physical key (Chinese, ...) are sent as Unicode;
     // the app's keyboard bridge switches this on for just those characters.
     window.__rdpKeyboardUnicodeMode = (enabled) => ui.setKeyboardUnicodeMode(Boolean(enabled));
