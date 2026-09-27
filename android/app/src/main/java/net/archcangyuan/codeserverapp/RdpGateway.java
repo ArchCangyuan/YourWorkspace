@@ -80,6 +80,25 @@ final class RdpGateway {
     // backgrounded remote desktop sends nothing, so the tunnels are pinged.
     private static final long TUNNEL_PING_SECONDS = 20L;
     private final Set<AccessWebSocket> openTunnels = ConcurrentHashMap.newKeySet();
+
+    /** Opens the content of a file picked on the device. */
+    interface UploadSource {
+        InputStream open() throws IOException;
+    }
+
+    private static final class StagedUpload {
+        final UploadSource source;
+        final long length;
+        final long stagedAt = System.currentTimeMillis();
+
+        StagedUpload(UploadSource source, long length) {
+            this.source = source;
+            this.length = length;
+        }
+    }
+
+    private static final long UPLOAD_TTL_MS = 10 * 60 * 1000L;
+    private final Map<String, StagedUpload> stagedUploads = new ConcurrentHashMap<>();
     private final ScheduledExecutorService pinger = Executors.newSingleThreadScheduledExecutor(
         runnable -> {
             Thread thread = new Thread(runnable, "RdpGateway-ping");
@@ -204,6 +223,20 @@ final class RdpGateway {
         return message == null || message.isEmpty() ? name : name + ": " + message;
     }
 
+    /**
+     * Stages a device file for the remote desktop page to fetch once, by the
+     * returned random id (valid for ten minutes, with a session token).
+     */
+    String stageUpload(UploadSource source, long length) {
+        long now = System.currentTimeMillis();
+        stagedUploads.values().removeIf(upload -> now - upload.stagedAt > UPLOAD_TTL_MS);
+        byte[] bytes = new byte[18];
+        random.nextBytes(bytes);
+        String id = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+        stagedUploads.put(id, new StagedUpload(source, length));
+        return id;
+    }
+
     String pageUrl(String sessionToken) {
         return origin() + "/rdp.html#" + sessionToken;
     }
@@ -260,6 +293,8 @@ final class RdpGateway {
                 runCleanPathSession(webSocket);
             } else if (method.equals("POST") && path.startsWith("/download?")) {
                 saveDownload(client, input, path, contentLength);
+            } else if (method.equals("GET") && path.startsWith("/upload?")) {
+                serveUpload(client, path);
             } else {
                 serveAsset(client, path);
             }
@@ -346,6 +381,38 @@ final class RdpGateway {
         output.write(body);
         output.flush();
         closeQuietly(client);
+    }
+
+    /** Streams a staged device file to the page, once. */
+    private void serveUpload(Socket client, String path) throws IOException {
+        OutputStream output = client.getOutputStream();
+        Map<String, String> query = parseQuery(path.substring(path.indexOf('?') + 1));
+        StagedUpload upload = sessionHosts.containsKey(query.getOrDefault("t", ""))
+            ? stagedUploads.remove(query.getOrDefault("id", ""))
+            : null;
+        if (upload == null) {
+            writeStatus(output, "404 Not Found");
+            closeQuietly(client);
+            return;
+        }
+        client.setSoTimeout(60_000);
+        try (InputStream content = upload.source.open()) {
+            String headers = "HTTP/1.1 200 OK\r\n"
+                + "Content-Type: application/octet-stream\r\n"
+                + (upload.length >= 0 ? "Content-Length: " + upload.length + "\r\n" : "")
+                + "Cache-Control: no-store\r\n"
+                + "Connection: close\r\n\r\n";
+            output.write(headers.getBytes(StandardCharsets.US_ASCII));
+            byte[] buffer = new byte[64 * 1024];
+            for (int count = content.read(buffer); count >= 0; count = content.read(buffer)) {
+                output.write(buffer, 0, count);
+            }
+            output.flush();
+        } catch (IOException | RuntimeException exception) {
+            // The page sees a truncated body or a closed connection.
+        } finally {
+            closeQuietly(client);
+        }
     }
 
     private static Map<String, String> parseQuery(String query) {

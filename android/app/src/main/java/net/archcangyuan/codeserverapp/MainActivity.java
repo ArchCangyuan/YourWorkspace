@@ -89,6 +89,7 @@ public final class MainActivity extends Activity {
     private static final long KEYBOARD_HOLD_TIMEOUT_MS = 1_500L;
     private static final int NOTIFICATION_PERMISSION_REQUEST = 2001;
     private static final int OVERLAY_PERMISSION_REQUEST = 2002;
+    private static final int UPLOAD_FILES_REQUEST = 2003;
     private static final long SESSION_KEEP_ALIVE_PULSE_MS = 10_000L;
     private static final String LEGACY_NATIVE_ZOOM_PERCENT_KEY = "zoom_percent";
     private static final String LAYOUT_ZOOM_STEPS_KEY = "layout_zoom_steps";
@@ -1862,6 +1863,8 @@ public final class MainActivity extends Activity {
     private final Set<WebView> rdpWebViews = Collections.newSetFromMap(new WeakHashMap<>());
     private FrameLayout contentFrame;
     private Button disconnectButton;
+    private Button uploadButton;
+    private WebView uploadTarget;
     private LinearLayout zoomOverlay;
     private TextView zoomPercentLabel;
     private SeekBar zoomSlider;
@@ -2039,6 +2042,12 @@ public final class MainActivity extends Activity {
         reloadButton.setContentDescription("Reload code-server");
         reloadButton.setOnClickListener(view -> webView.reload());
         addressBar.addView(reloadButton);
+
+        uploadButton = createToolbarButton("⇪");
+        uploadButton.setContentDescription("Upload files to the remote desktop");
+        uploadButton.setOnClickListener(view -> pickFilesToUpload());
+        uploadButton.setVisibility(View.GONE);
+        addressBar.addView(uploadButton);
 
         disconnectButton = createToolbarButton("⏏");
         disconnectButton.setContentDescription("Disconnect the remote desktop");
@@ -2575,7 +2584,110 @@ public final class MainActivity extends Activity {
         if (requestCode == OVERLAY_PERMISSION_REQUEST) {
             applyKeepAliveMode();
             requestBatteryOptimizationExemption();
+        } else if (requestCode == UPLOAD_FILES_REQUEST) {
+            WebView target = uploadTarget;
+            uploadTarget = null;
+            if (resultCode == RESULT_OK && data != null && target != null
+                && rdpWebViews.contains(target)) {
+                offerUploads(target, data);
+            }
         }
+    }
+
+    /**
+     * Picks device files for the remote desktop in front. They are put on the
+     * remote clipboard, to be pasted (Ctrl+V) in Windows.
+     */
+    private void pickFilesToUpload() {
+        if (webView == null || !rdpWebViews.contains(webView)) {
+            return;
+        }
+        uploadTarget = webView;
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT)
+            .addCategory(Intent.CATEGORY_OPENABLE)
+            .setType("*/*")
+            .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+        try {
+            startActivityForResult(intent, UPLOAD_FILES_REQUEST);
+        } catch (android.content.ActivityNotFoundException exception) {
+            uploadTarget = null;
+            Toast.makeText(this, "No file picker available", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void offerUploads(WebView target, Intent data) {
+        List<Uri> uris = new ArrayList<>();
+        if (data.getClipData() != null) {
+            for (int index = 0; index < data.getClipData().getItemCount(); index++) {
+                uris.add(data.getClipData().getItemAt(index).getUri());
+            }
+        } else if (data.getData() != null) {
+            uris.add(data.getData());
+        }
+        if (uris.isEmpty()) {
+            return;
+        }
+        RdpGateway gateway;
+        try {
+            gateway = RdpGateway.get(this);
+        } catch (IOException exception) {
+            Toast.makeText(this, "Could not prepare the upload", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        JSONArray items = new JSONArray();
+        for (Uri uri : uris) {
+            String name = "file";
+            long size = -1L;
+            try (android.database.Cursor cursor = getContentResolver().query(
+                uri,
+                new String[] {
+                    android.provider.OpenableColumns.DISPLAY_NAME,
+                    android.provider.OpenableColumns.SIZE
+                },
+                null,
+                null,
+                null
+            )) {
+                if (cursor != null && cursor.moveToFirst()) {
+                    if (!cursor.isNull(0)) {
+                        name = cursor.getString(0);
+                    }
+                    if (!cursor.isNull(1)) {
+                        size = cursor.getLong(1);
+                    }
+                }
+            } catch (RuntimeException ignored) {
+                // Keep the defaults.
+            }
+            String id = gateway.stageUpload(
+                () -> {
+                    java.io.InputStream stream = getContentResolver().openInputStream(uri);
+                    if (stream == null) {
+                        throw new IOException("Could not open " + uri);
+                    }
+                    return stream;
+                },
+                size
+            );
+            try {
+                JSONObject item = new JSONObject();
+                item.put("id", id);
+                item.put("name", DownloadSaver.safeName(name));
+                item.put("size", size);
+                items.put(item);
+            } catch (Exception ignored) {
+                // Plain values.
+            }
+        }
+        target.evaluateJavascript(
+            "window.__rdpUploadFromApp ? (window.__rdpUploadFromApp(" + items + "), true) : false",
+            value -> {
+                if (!"true".equals(value)) {
+                    Toast.makeText(this, "The remote desktop is not ready", Toast.LENGTH_SHORT)
+                        .show();
+                }
+            }
+        );
     }
 
     /**
@@ -3631,6 +3743,7 @@ public final class MainActivity extends Activity {
         if (disconnectButton != null) {
             boolean rdpActive = webView != null && rdpWebViews.contains(webView);
             disconnectButton.setVisibility(rdpActive ? View.VISIBLE : View.GONE);
+            uploadButton.setVisibility(rdpActive ? View.VISIBLE : View.GONE);
         }
         if (contentFrame == null || addressBar == null) {
             return;

@@ -37,10 +37,9 @@
   #status[hidden] {
     display: none;
   }
-  #downloads {
+  .transfer {
     position: fixed;
     left: 50%;
-    bottom: 12px;
     transform: translateX(-50%);
     width: min(440px, calc(100% - 24px));
     box-sizing: border-box;
@@ -51,38 +50,38 @@
     font-size: 13px;
     box-shadow: 0 4px 18px rgba(0, 0, 0, 0.25);
   }
-  #downloads[hidden] {
+  .transfer[hidden] {
     display: none;
   }
-  #downloads header {
+  .transfer header {
     display: flex;
     align-items: center;
     gap: 8px;
     font-weight: 600;
     margin-bottom: 6px;
   }
-  #downloads header span {
+  .transfer header span {
     flex: 1;
   }
-  #downloads .row {
+  .transfer .row {
     display: flex;
     align-items: center;
     gap: 8px;
     padding: 4px 0;
   }
-  #downloads .name {
+  .transfer .name {
     flex: 1;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  #downloads .state {
+  .transfer .state {
     color: #666;
     font-size: 12px;
     white-space: nowrap;
   }
-  #downloads button {
+  .transfer button {
     border: 0;
     border-radius: 8px;
     padding: 5px 10px;
@@ -90,14 +89,20 @@
     color: #fff;
     font-size: 12px;
   }
-  #downloads button.plain {
+  .transfer button.plain {
     background: transparent;
     color: #444;
     font-size: 15px;
     padding: 2px 6px;
   }
-  #downloads button:disabled {
+  .transfer button:disabled {
     opacity: 0.5;
+  }
+  #downloads {
+    bottom: 12px;
+  }
+  #uploads {
+    top: 12px;
   }
   #status small {
     display: block;
@@ -110,7 +115,8 @@
 </head>
 <body>
 <div id="status">Connecting…</div>
-<div id="downloads" hidden></div>
+<div id="downloads" class="transfer" hidden></div>
+<div id="uploads" class="transfer" hidden></div>
 <script>
   // Tells the app's page bridge to leave the viewport alone (see rdp zoom).
   window.__yourWorkspaceRdpPage = true;
@@ -600,7 +606,93 @@
     const row = fileRows.get(progress.transferId);
     if (row) row.state.textContent = `${Math.round(progress.percentage)}%`;
   });
-  fileTransfer.on('error', (error) => console.warn('file transfer:', error.message));
+  // Device files the app picked (⇪): fetched from the gateway and put on the
+  // remote clipboard, to be pasted with Ctrl+V in Windows.
+  const uploadsElement = document.getElementById('uploads');
+  const uploadRows = new Map();
+  const uploadStateByFile = new WeakMap();
+  const uploadBar = (titleText) => {
+    uploadsElement.replaceChildren();
+    const header = document.createElement('header');
+    const title = document.createElement('span');
+    title.textContent = titleText;
+    const close = document.createElement('button');
+    close.className = 'plain';
+    close.textContent = '✕';
+    close.addEventListener('click', () => { uploadsElement.hidden = true; });
+    header.append(title, close);
+    uploadsElement.append(header);
+    uploadsElement.hidden = false;
+    return title;
+  };
+  const uploadRow = (name, stateText) => {
+    const element = document.createElement('div');
+    element.className = 'row';
+    const label = document.createElement('span');
+    label.className = 'name';
+    label.textContent = name;
+    const state = document.createElement('span');
+    state.className = 'state';
+    state.textContent = stateText;
+    element.append(label, state);
+    uploadsElement.append(element);
+    return state;
+  };
+  window.__rdpUploadFromApp = async (items) => {
+    const title = uploadBar(items.length === 1 ? 'Preparing 1 file…' : `Preparing ${items.length} files…`);
+    const states = items.map((item) => uploadRow(item.name, formatSize(item.size)));
+    const files = [];
+    const fileStates = [];
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index];
+      try {
+        const response = await fetch(
+          `/upload?t=${encodeURIComponent(sessionToken)}&id=${encodeURIComponent(item.id)}`
+        );
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const blob = await response.blob();
+        const file = new File([blob], item.name, { lastModified: Date.now() });
+        files.push(file);
+        fileStates.push(states[index]);
+        uploadStateByFile.set(file, states[index]);
+        states[index].textContent = formatSize(blob.size) || 'Ready';
+      } catch (error) {
+        states[index].textContent = `Failed: ${String(error?.message || error).slice(0, 60)}`;
+      }
+    }
+    if (!files.length) {
+      title.textContent = 'Could not read the files';
+      return;
+    }
+    uploadRows.clear();
+    try {
+      const { transferIds } = fileTransfer.uploadFiles(files);
+      for (const [fileIndex, transferId] of transferIds || []) {
+        uploadRows.set(transferId, fileStates[fileIndex]);
+      }
+    } catch (error) {
+      title.textContent = `Upload failed: ${String(error?.message || error).slice(0, 80)}`;
+      return;
+    }
+    title.textContent = files.length === 1
+      ? 'On the remote clipboard: paste it in Windows (Ctrl+V)'
+      : `${files.length} files on the remote clipboard: paste them in Windows (Ctrl+V)`;
+  };
+  fileTransfer.on('upload-progress', (progress) => {
+    const state = uploadRows.get(progress.transferId);
+    if (state) state.textContent = `${Math.round(progress.percentage)}%`;
+  });
+  fileTransfer.on('upload-complete', (file) => {
+    const state = uploadStateByFile.get(file);
+    if (state) state.textContent = 'Copied';
+  });
+  fileTransfer.on('error', (error) => {
+    console.warn('file transfer:', error.message);
+    const state = error.transferId != null
+      ? (uploadRows.get(error.transferId) || fileRows.get(error.transferId)?.state)
+      : null;
+    if (state) state.textContent = `Failed: ${String(error.message).slice(0, 60)}`;
+  });
 
   element.addEventListener('ready', (event) => {
     ui = event.detail.irgUserInteraction;
