@@ -145,7 +145,7 @@ private let keyboardBridgeSource = #"""
   window.__codeServerAppIsRdpPage = () => Boolean(findIronRdpCanvas());
 
   const existingBridge = window.__codeServerAppKeyboard;
-  if (existingBridge && existingBridge.version >= 15) {
+  if (existingBridge && existingBridge.version >= 16) {
     window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
     existingBridge.installRdpGestures?.();
     existingBridge.installDesktopGestures?.();
@@ -1419,8 +1419,27 @@ private let keyboardBridgeSource = #"""
     return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
   };
 
+  // Controls the page marks as app UI (e.g. the remote desktop's file
+  // bars) keep normal touch behaviour in mouse mode.
+  const appUiTouchIds = new Set();
+  const isAppUiEvent = (event) => {
+    const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+    return path.some((node) => node?.hasAttribute?.('data-your-workspace-ui'));
+  };
+
   const handleMouseModeTouch = (event) => {
     if (!mouseMode.enabled) return;
+    const changed = Array.from(event.changedTouches || []);
+    if (event.type === 'touchstart' && isAppUiEvent(event)) {
+      for (const touch of changed) appUiTouchIds.add(touch.identifier);
+      return;
+    }
+    if (changed.length && changed.every((touch) => appUiTouchIds.has(touch.identifier))) {
+      if (event.type === 'touchend' || event.type === 'touchcancel') {
+        for (const touch of changed) appUiTouchIds.delete(touch.identifier);
+      }
+      return;
+    }
     if (event.cancelable) event.preventDefault();
     event.stopImmediatePropagation();
     const type = event.type;
@@ -1513,7 +1532,7 @@ private let keyboardBridgeSource = #"""
   // Keep real touch-derived pointer and mouse events away from the page so
   // only the emulated mouse reaches it.
   const blockNativePointerEvents = (event) => {
-    if (!mouseMode.enabled || !event.isTrusted) return;
+    if (!mouseMode.enabled || !event.isTrusted || isAppUiEvent(event)) return;
     if (event.pointerType === 'mouse' || event.pointerType === 'pen') return;
     event.stopImmediatePropagation();
     if (event.cancelable) event.preventDefault();
@@ -1567,7 +1586,7 @@ private let keyboardBridgeSource = #"""
   };
 
   const bridge = {
-    version: 15,
+    version: 16,
     forceKeyboard() {
       installRdpGestures();
       const canvas = findIronRdpCanvas();

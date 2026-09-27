@@ -37,11 +37,19 @@
   #status[hidden] {
     display: none;
   }
-  .transfer {
+  /* Floating at the top, above the remote desktop canvas. */
+  #transfers {
     position: fixed;
+    top: 12px;
     left: 50%;
     transform: translateX(-50%);
     width: min(440px, calc(100% - 24px));
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .transfer {
     box-sizing: border-box;
     padding: 10px 12px;
     border-radius: 14px;
@@ -98,12 +106,6 @@
   .transfer button:disabled {
     opacity: 0.5;
   }
-  #downloads {
-    bottom: 12px;
-  }
-  #uploads {
-    top: 12px;
-  }
   #status small {
     display: block;
     margin-top: 6px;
@@ -115,8 +117,10 @@
 </head>
 <body>
 <div id="status">Connecting…</div>
-<div id="downloads" class="transfer" hidden></div>
-<div id="uploads" class="transfer" hidden></div>
+<div id="transfers" data-your-workspace-ui>
+  <div id="downloads" class="transfer" hidden></div>
+  <div id="uploads" class="transfer" hidden></div>
+</div>
 <script>
   // Tells the app's page bridge to leave the viewport alone (see rdp zoom).
   window.__yourWorkspaceRdpPage = true;
@@ -155,7 +159,17 @@
   // IronRDP synchronizes the clipboard through navigator.clipboard, which a
   // WebView cannot read. Back it with the Android clipboard instead.
   if (nativeBridge) {
-    const readText = async () => nativeBridge.clipboardText() || '';
+    // IronRDP polls the local clipboard; a change means it was replaced
+    // (copied on the phone, or text copied on the PC arrived).
+    let lastClipboardText = null;
+    const readText = async () => {
+      const text = nativeBridge.clipboardText() || '';
+      if (lastClipboardText !== null && text !== lastClipboardText) {
+        window.dispatchEvent(new Event('yourworkspace-clipboard-replaced'));
+      }
+      lastClipboardText = text;
+      return text;
+    };
     const textType = (types) => types.find((type) => type.startsWith('text/plain'))
       || types.find((type) => type.startsWith('text/'));
     const writeText = async (text) => nativeBridge.setClipboardText(String(text ?? ''));
@@ -553,6 +567,8 @@
     }
   };
   const showFiles = (files) => {
+    // The bar always shows the latest files copied on the PC.
+    fileRows.clear();
     downloadsElement.replaceChildren();
     const entries = files
       .map((file, index) => ({ file, index }))
@@ -602,6 +618,10 @@
     downloadsElement.hidden = false;
   };
   fileTransfer.on('files-available', showFiles);
+  // Other clipboard content replaced the copied files: they are gone.
+  window.addEventListener('yourworkspace-clipboard-replaced', () => {
+    downloadsElement.hidden = true;
+  });
   fileTransfer.on('download-progress', (progress) => {
     const row = fileRows.get(progress.transferId);
     if (row) row.state.textContent = `${Math.round(progress.percentage)}%`;
