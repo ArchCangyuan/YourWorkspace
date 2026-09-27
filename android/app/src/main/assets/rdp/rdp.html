@@ -143,6 +143,23 @@
   .transfer [hidden] {
     display: none;
   }
+  .transfer button.small {
+    font-size: 12px;
+  }
+  .transfer pre.log {
+    max-height: 40vh;
+    margin: 0 0 6px;
+    padding: 6px;
+    overflow: auto;
+    border-radius: 6px;
+    background: #fff;
+    color: #333;
+    font-size: 10px;
+    white-space: pre-wrap;
+    word-break: break-all;
+    user-select: text;
+    -webkit-user-select: text;
+  }
   .transfer button:disabled {
     opacity: 0.5;
   }
@@ -253,7 +270,7 @@
   const { init, Backend, displayControl, enableCredssp, RdpFileTransferProvider } =
     await import('./iron-remote-desktop-rdp.js');
   await import('./iron-remote-desktop.js');
-  await init('WARN');
+  await init('INFO');
 
   // The page stays at scale 1, so CSS pixels map to the WebView at all
   // times. The app's zoom sets the desktop's pixel density instead (see
@@ -712,12 +729,23 @@
   let lastClipboardWarning = '';
   // Logged once when the session starts: the PC does not take files.
   let clipboardCapabilityWarning = '';
-  for (const level of ['warn', 'error']) {
+  // Recent clipboard lines from IronRDP, shown by the upload bar's Log button.
+  const clipboardLog = [];
+  for (const level of ['log', 'info', 'debug', 'warn', 'error']) {
     const original = console[level].bind(console);
     console[level] = (...args) => {
       const text = args.map(String).join(' ');
+      if (/cliprdr|clipboard|file|format ?list|FormatData|lock|upload/i.test(text)) {
+        clipboardLog.push(`${new Date().toISOString().slice(11, 19)} ${text
+          .replace(/%c/g, '').replace(/\s+/g, ' ').replace(/^\S+Z /, '').slice(0, 300)}`);
+        if (clipboardLog.length > 60) clipboardLog.shift();
+      }
+      if (level !== 'warn' && level !== 'error') {
+        original(...args);
+        return;
+      }
       if (/not negotiated/i.test(text)) clipboardCapabilityWarning = text.slice(0, 400);
-      if (/FILECLIP|FileContents|FileGroupDescriptor|file copy|file list|Cliprdr/i.test(text)) {
+      if (/FILECLIP|FileContents|FileGroupDescriptor|file copy|file list|format list|Cliprdr/i.test(text)) {
         lastClipboardWarning = text.replace(/\s+/g, ' ')
           .replace(/^\S+Z (ERROR|WARN) [\w:]+: /, '').slice(0, 400);
       }
@@ -805,8 +833,19 @@
       window.clearTimeout(uploadHideTimer);
       uploadsElement.hidden = true;
     });
-    header.append(title, paste, close);
-    uploadsElement.append(header);
+    const logButton = document.createElement('button');
+    logButton.className = 'plain small';
+    logButton.textContent = 'Log';
+    const logView = document.createElement('pre');
+    logView.className = 'log';
+    logView.hidden = true;
+    logButton.addEventListener('click', () => {
+      logView.hidden = !logView.hidden;
+      logView.textContent = clipboardLog.join('\n') || '(no clipboard messages)';
+      window.clearTimeout(uploadHideTimer);
+    });
+    header.append(title, paste, logButton, close);
+    uploadsElement.append(header, logView);
     const rows = items.map((item) => {
       const element = document.createElement('div');
       element.className = 'item';
@@ -897,13 +936,15 @@
     if (!lastClipboardWarning && /FILECLIP_ENABLED not negotiated/i.test(clipboardCapabilityWarning)) {
       lastClipboardWarning = clipboardCapabilityWarning;
     }
-    const refused = () => /Initiate file copy failed|FILECLIP_ENABLED not negotiated/i.test(lastClipboardWarning);
+    const refused = () => /Initiate file copy failed|FILECLIP_ENABLED not negotiated|rejected our format list/i.test(lastClipboardWarning);
     const failRefused = () => {
       abandonPendingUpload();
       const reason = /not in Ready state/i.test(lastClipboardWarning)
         ? 'the PC\'s clipboard is not available (clipboard redirection off, or still starting)'
         : /not negotiated/i.test(lastClipboardWarning)
           ? 'the PC does not allow file copy over the clipboard'
+          : /rejected our format list/i.test(lastClipboardWarning)
+            ? 'the PC rejected the file list'
           : lastClipboardWarning;
       for (const row of pickedRows) failRow(row, reason);
       current.paste.hidden = true;
@@ -916,9 +957,11 @@
     }
     current.paste.hidden = false;
     updateUploadTitle();
-    window.setTimeout(() => {
-      if (current === upload && refused() && !pickedRows.some((row) => row.sent)) failRefused();
-    }, 500);
+    for (const delay of [500, 2000, 5000]) {
+      window.setTimeout(() => {
+        if (current === upload && refused() && !pickedRows.some((row) => row.sent)) failRefused();
+      }, delay);
+    }
   };
   // The clipboard changed (copied on the phone, or on the PC) before Windows
   // read the files: the PC's clipboard no longer holds them.
