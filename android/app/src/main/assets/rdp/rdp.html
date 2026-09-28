@@ -276,7 +276,7 @@
   const { init, Backend, displayControl, enableCredssp, RdpFileTransferProvider } =
     await import('./iron-remote-desktop-rdp.js');
   await import('./iron-remote-desktop.js');
-  await init('INFO');
+  await init('DEBUG');
 
   // The page stays at scale 1, so CSS pixels map to the WebView at all
   // times. The app's zoom sets the desktop's pixel density instead (see
@@ -744,7 +744,7 @@
       if (/cliprdr|clipboard|file|format ?list|FormatData|lock|upload/i.test(text)) {
         clipboardLog.push(`${new Date().toISOString().slice(11, 19)} ${text
           .replace(/%c/g, '').replace(/\s+/g, ' ').replace(/^\S+Z /, '').slice(0, 300)}`);
-        if (clipboardLog.length > 60) clipboardLog.shift();
+        if (clipboardLog.length > 120) clipboardLog.shift();
       }
       if (level !== 'warn' && level !== 'error') {
         original(...args);
