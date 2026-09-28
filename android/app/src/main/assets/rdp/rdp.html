@@ -953,7 +953,19 @@
         + (channel ? `\n--- clipboard channel (gateway) ---\n${channel}` : '');
       window.clearTimeout(uploadHideTimer);
     });
-    header.append(title, paste, logButton, close);
+    // Shown when the PC stops answering: reconnecting restarts the PC's
+    // clipboard session and the files are announced again afterwards.
+    const retry = document.createElement('button');
+    retry.textContent = 'Retry';
+    retry.title = 'Reconnect and put the files on the PC clipboard again';
+    retry.hidden = true;
+    retry.addEventListener('click', () => {
+      retry.hidden = true;
+      gatewayNote('app: Retry pressed (reconnecting)');
+      title.textContent = 'Reconnecting to restart the PC clipboard…';
+      try { ui?.shutdown?.(); } catch (_) {}
+    });
+    header.append(title, retry, paste, logButton, close);
     uploadsElement.append(header, logView);
     const rows = items.map((item) => {
       const element = document.createElement('div');
@@ -976,7 +988,7 @@
       setRow(row, formatSize(item.size) || 'Waiting', 0);
       return row;
     });
-    upload = { rows, title, paste, phase: 'reading', byTransferId: new Map(), byFile: new Map() };
+    upload = { rows, title, paste, retry, phase: 'reading', byTransferId: new Map(), byFile: new Map() };
     const current = upload;
     uploadsElement.hidden = false;
     updateUploadTitle();
@@ -1084,9 +1096,13 @@
       if (waiting > 7000 && !stalled) {
         stalled = true;
         gatewayNote(`app: PC has not answered the file list for ${Math.round(waiting / 1000)} s`);
-        current.title.textContent = 'Windows clipboard is not responding (rdpclip.exe): paste may not work';
+        current.title.textContent = 'Windows clipboard is not responding: tap Retry';
+        current.retry.hidden = false;
+        current.paste.hidden = true;
       } else if (!waiting && stalled) {
         stalled = false;
+        current.retry.hidden = true;
+        current.paste.hidden = false;
         updateUploadTitle();
       }
       window.setTimeout(watchStall, 2000);
