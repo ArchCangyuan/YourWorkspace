@@ -490,7 +490,9 @@
   };
 
   const scheduleReconnect = (reason) => {
-    console.warn('rdp disconnected:', reason);
+    let gatewayState = '';
+    try { gatewayState = JSON.stringify(gatewayStatus()); } catch (_) {}
+    console.warn('rdp disconnected:', typeof reason === 'string' ? reason : JSON.stringify(reason), gatewayState);
     connected = false;
     resizeInFlight = false;
     changedWhileInFlight = false;
@@ -741,7 +743,8 @@
     const original = console[level].bind(console);
     console[level] = (...args) => {
       const text = args.map(String).join(' ');
-      if (/cliprdr|clipboard|file|format ?list|FormatData|lock|upload/i.test(text)) {
+      if (level === 'warn' || level === 'error'
+          || /cliprdr|clipboard|file|format ?list|FormatData|lock|upload|disconnect|terminat|panic/i.test(text)) {
         clipboardLog.push(`${new Date().toISOString().slice(11, 19)} ${text
           .replace(/%c/g, '').replace(/\s+/g, ' ').replace(/^\S+Z /, '').slice(0, 300)}`);
         if (clipboardLog.length > 120) clipboardLog.shift();
