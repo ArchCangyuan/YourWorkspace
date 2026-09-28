@@ -772,17 +772,24 @@
   // IronRDP polls the phone clipboard and sends any change to the PC, which
   // would replace uploaded files there. It suspends that only while the file
   // list is being sent; hold it until Windows has read the files instead.
-  const clipboardHold = { suppress: null, resume: null, held: false, timer: 0 };
+  // A real copy on the phone meanwhile ends the hold (the page keeps reading
+  // the clipboard): the newest content wins, as with any copy.
+  const clipboardHold = { suppress: null, resume: null, held: false, timer: 0, poll: 0 };
   const holdClipboard = () => {
     if (!clipboardHold.suppress) return;
     clipboardHold.suppress();
     clipboardHold.held = true;
     window.clearTimeout(clipboardHold.timer);
     clipboardHold.timer = window.setTimeout(releaseClipboard, 10 * 60 * 1000);
+    window.clearInterval(clipboardHold.poll);
+    clipboardHold.poll = window.setInterval(() => {
+      if (document.hasFocus()) navigator.clipboard.readText().catch(() => {});
+    }, 300);
     console.info('clipboard: sync from the phone paused until the files are pasted');
   };
   const releaseClipboard = () => {
     window.clearTimeout(clipboardHold.timer);
+    window.clearInterval(clipboardHold.poll);
     if (!clipboardHold.held) return;
     clipboardHold.held = false;
     clipboardHold.resume?.();
@@ -999,9 +1006,9 @@
     if (!upload || upload.phase !== 'clipboard') return;
     const waiting = upload.rows.filter((row) => !row.done && !row.failed && !row.sent);
     if (!waiting.length) return;
-    for (const row of waiting) failRow(row, 'the clipboard changed before pasting; upload again');
+    for (const row of waiting) failRow(row, 'replaced by a newer copy; upload again to paste it');
     upload.paste.hidden = true;
-    upload.title.textContent = 'Replaced on the PC\'s clipboard';
+    upload.title.textContent = 'Replaced by what you copied';
     abandonPendingUpload();
   });
   fileTransfer.on('upload-progress', (progress) => {
