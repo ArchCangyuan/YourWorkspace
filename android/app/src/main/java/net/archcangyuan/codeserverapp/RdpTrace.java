@@ -56,6 +56,7 @@ final class RdpTrace {
     /** Clipboard rewrites, switchable from the page for diagnosis. */
     static volatile boolean addFileContents = false;
     static volatile boolean clearClipDataLocking = false;
+    static volatile boolean excludeFromClipboardHistory = true;
 
     static boolean setOption(String name, boolean value) {
         switch (name) {
@@ -64,6 +65,9 @@ final class RdpTrace {
                 return true;
             case "clearClipDataLocking":
                 clearClipDataLocking = value;
+                return true;
+            case "excludeFromClipboardHistory":
+                excludeFromClipboardHistory = value;
                 return true;
             default:
                 return false;
@@ -76,7 +80,12 @@ final class RdpTrace {
             if (monitorReadyCount == 0) {
                 forward = withoutEarlyClipboard(message);
             } else {
-                forward = addFileContents ? withFileContentsFormat(message) : message;
+                forward = addFileContents
+                    ? withExtraFileListFormat(message, FILE_CONTENTS_FORMAT_ID, "FileContents")
+                    : message;
+                forward = excludeFromClipboardHistory
+                    ? withExtraFileListFormat(forward, HISTORY_EXCLUSION_FORMAT_ID, HISTORY_EXCLUSION_FORMAT)
+                    : forward;
                 forward = clearClipDataLocking ? withoutClipDataLocking(forward) : forward;
             }
         }
@@ -85,12 +94,20 @@ final class RdpTrace {
     }
 
     /**
-     * Adds a FileContents entry to file lists (FileGroupDescriptorW and
-     * Preferred DropEffect only). Off by default: Windows left such lists
-     * unanswered, while the plain list pastes fine once clipboard locking is
-     * off (checked on the PC, 2026-09-28).
+     * Adds a format to the phone's file lists (FileGroupDescriptorW and
+     * Preferred DropEffect).
+     *
+     * FileContents: off by default, Windows left such lists unanswered.
+     *
+     * ExcludeClipboardContentFromMonitorProcessing: on by default. Windows'
+     * clipboard history service reads every new clipboard entry; on the
+     * files announced from the phone it hung together with Explorer and the
+     * PC's rdpclip until that service was restarted (killing rdpclip alone
+     * did not help). The format tells clipboard monitors to skip the entry.
+     * Its data is never needed; IronRDP answers a request for it with an
+     * error response.
      */
-    private byte[] withFileContentsFormat(byte[] message) {
+    private byte[] withExtraFileListFormat(byte[] message, int formatId, String formatName) {
         java.io.ByteArrayOutputStream out = null;
         int offset = 0;
         int copied = 0;
@@ -100,7 +117,7 @@ final class RdpTrace {
                 break;
             }
             byte[] rewritten = (message[offset] & 0xFF) == 3
-                ? fileListWithFileContents(message, offset, length)
+                ? fileListWithFormat(message, offset, length, formatId, formatName)
                 : null;
             if (rewritten != null) {
                 if (out == null) {
@@ -117,7 +134,7 @@ final class RdpTrace {
         }
         out.write(message, copied, message.length - copied);
         clipEvents.addLast(String.format(Locale.US,
-            "%tT.%<tL gateway added FileContents to the file list", System.currentTimeMillis()));
+            "%tT.%<tL gateway added %s to the file list", System.currentTimeMillis(), formatName));
         return out.toByteArray();
     }
 
@@ -157,8 +174,10 @@ final class RdpTrace {
     }
 
     private static final int FILE_CONTENTS_FORMAT_ID = 0xC0FC;
+    private static final int HISTORY_EXCLUSION_FORMAT_ID = 0xC0F0;
+    private static final String HISTORY_EXCLUSION_FORMAT = "ExcludeClipboardContentFromMonitorProcessing";
 
-    private byte[] fileListWithFileContents(byte[] data, int offset, int length) {
+    private byte[] fileListWithFormat(byte[] data, int offset, int length, int formatId, String name) {
         int end = offset + length;
         int mcs = offset + 7;
         if (length < 16 || (data[mcs] & 0xFF) != 0x64) {
@@ -177,13 +196,12 @@ final class RdpTrace {
             return null;
         }
         String formats = formatNames(data, body + 8, end);
-        if (!formats.contains("FileGroupDescriptorW") || formats.contains("FileContents")) {
+        if (!formats.contains("FileGroupDescriptorW") || formats.contains(name)) {
             return null;
         }
-        byte[] entry = new byte[4 + ("FileContents".length() + 1) * 2];
-        entry[0] = (byte) FILE_CONTENTS_FORMAT_ID;
-        entry[1] = (byte) (FILE_CONTENTS_FORMAT_ID >>> 8);
-        String name = "FileContents";
+        byte[] entry = new byte[4 + (name.length() + 1) * 2];
+        entry[0] = (byte) formatId;
+        entry[1] = (byte) (formatId >>> 8);
         for (int index = 0; index < name.length(); index++) {
             entry[4 + index * 2] = (byte) name.charAt(index);
         }
