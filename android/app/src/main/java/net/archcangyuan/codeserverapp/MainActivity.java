@@ -2470,6 +2470,21 @@ public final class MainActivity extends Activity {
         } else {
             stopService(serviceIntent);
         }
+        updateScreenAwake();
+    }
+
+    /**
+     * Keeps the screen on while a built-in remote desktop is the page on
+     * screen. The window flag only applies while the app is in the
+     * foreground, so code-server pages and the background let it sleep.
+     */
+    private void updateScreenAwake() {
+        boolean remoteDesktopShown = webView != null && rdpWebViews.contains(webView);
+        if (remoteDesktopShown) {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        } else {
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        }
     }
 
     private void requestKeepAlivePermissions() {
@@ -3052,6 +3067,7 @@ public final class MainActivity extends Activity {
         activeSessionKey = null;
         showZoomOf(null);
         restoreInputModes(null);
+        updateScreenAwake();
     }
 
     /** Per-project preference key; pages outside a project use the global one. */
@@ -3607,6 +3623,7 @@ public final class MainActivity extends Activity {
         syncModifiers(webView);
         syncMouseMode(webView);
         updateAddressBarOverlay();
+        updateScreenAwake();
     }
 
     private void cleanupExpiredProjectSessions(long now) {
