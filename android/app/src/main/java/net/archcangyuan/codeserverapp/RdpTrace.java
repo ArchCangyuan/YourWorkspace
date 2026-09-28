@@ -33,6 +33,7 @@ final class RdpTrace {
     private byte[] clientTempDirectory;
     private int monitorReadyCount;
     private int earlyDropped;
+    private boolean clientSynced;
     private byte[] pendingReplay;
 
     // The virtual channel message being chunked, if any.
@@ -54,7 +55,7 @@ final class RdpTrace {
      */
     synchronized byte[] fromClient(byte[] message) {
         byte[] forward = message;
-        if (pending.length == 0 && cliprdrChannel >= 0) {
+        if (clientSynced && pending.length == 0 && cliprdrChannel >= 0) {
             if (monitorReadyCount == 0) {
                 forward = withoutEarlyClipboard(message);
             } else {
@@ -205,6 +206,16 @@ final class RdpTrace {
 
     private void record(byte[] message) {
         bytesUp += message.length;
+        // Before RDP proper the client sends CredSSP (ASN.1) messages, which
+        // would be misread as PDUs and throw the framing off for good. Start
+        // at the first TPKT (MCS Connect Initial).
+        if (!clientSynced) {
+            if (message.length < 4 || message[0] != 3 || message[1] != 0) {
+                return;
+            }
+            clientSynced = true;
+            pending = new byte[0];
+        }
         if (cliprdrIndex < 0) {
             cliprdrIndex = findClientChannel(message, "cliprdr");
         }
