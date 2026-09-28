@@ -18,6 +18,9 @@
     width: 100%;
     height: 100%;
     overflow: hidden;
+    /* Its own compositing layer, so overlays appearing above it (the file
+       bars) do not make the WebView rebuild layers and flash. */
+    will-change: transform;
   }
   #status {
     position: fixed;
@@ -48,6 +51,8 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
+    /* Always a layer of its own (also while empty); see iron-remote-desktop. */
+    will-change: transform;
   }
   .transfer {
     box-sizing: border-box;
