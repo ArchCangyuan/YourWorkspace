@@ -753,6 +753,12 @@
     const original = console[level].bind(console);
     console[level] = (...args) => {
       const text = args.map(String).join(' ');
+      // The capability exchange is one huge line; keep its channel chunk sizes.
+      if (/ServerDemandActive|ClientConfirmActive/.test(text)) {
+        const channel = text.match(/VirtualChannel\(VirtualChannel \{[^}]*\}\)/);
+        const side = /ServerDemandActive/.test(text) ? 'server' : 'client';
+        clipboardLog.push(`${new Date().toISOString().slice(11, 19)} caps ${side}: ${channel ? channel[0] : 'no VirtualChannel'}`);
+      }
       if (level === 'warn' || level === 'error'
           || /cliprdr|clipboard|file|format ?list|FormatData|lock|upload|disconnect|terminat|panic/i.test(text)) {
         clipboardLog.push(`${new Date().toISOString().slice(11, 19)} ${text
