@@ -216,6 +216,7 @@ final class RdpGateway {
             RdpTrace trace = sessionTraces.get(sessionToken);
             status.put("clipboard", trace == null ? "" : trace.clipboardLog());
             status.put("fileListWaitMs", trace == null ? 0 : trace.fileListWaitMs());
+            status.put("clipboardReady", trace != null && trace.clipboardReady());
         } catch (org.json.JSONException ignored) {
             // Fields are plain strings.
         }

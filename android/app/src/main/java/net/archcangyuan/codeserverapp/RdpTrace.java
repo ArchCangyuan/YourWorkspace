@@ -376,6 +376,13 @@ final class RdpTrace {
     }
 
     /** The recent clipboard messages, one per line. */
+    /** The PC has answered a format list on this connection. */
+    private boolean clipboardReady;
+
+    synchronized boolean clipboardReady() {
+        return clipboardReady;
+    }
+
     /** When the phone announced files that the PC has not answered yet, else 0. */
     private long formatListSentAt;
 
@@ -438,6 +445,7 @@ final class RdpTrace {
         }
         if (mcsChoice == 0x68 && type == 3) {
             formatListSentAt = 0;
+            clipboardReady = true;
         }
         int flags = (data[body + 2] & 0xFF) | ((data[body + 3] & 0xFF) << 8);
         long dataLength = le32(data, body + 4);

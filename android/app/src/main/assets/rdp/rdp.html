@@ -618,6 +618,7 @@
     checkAppliedSize(size, 2, true);
     showStatus('');
     notifyNative('connected');
+    reannouncePendingUpload();
     try {
       const termination = await session.run();
       scheduleReconnect(termination.reason());
@@ -1022,6 +1023,8 @@
       updateUploadTitle();
       return;
     }
+    current.files = files;
+    current.pickedRows = pickedRows;
     try {
       const { transferIds, completion } = fileTransfer.uploadFiles(files);
       holdClipboard();
@@ -1089,6 +1092,39 @@
       window.setTimeout(watchStall, 2000);
     };
     window.setTimeout(watchStall, 2000);
+  };
+  // A reconnect starts a new clipboard session on the PC without the files:
+  // announce the ones still waiting for paste again once it is ready.
+  let reannounceToken = 0;
+  const reannouncePendingUpload = async () => {
+    const pending = upload;
+    if (!pending || pending.phase !== 'clipboard' || !pending.files?.length) return;
+    if (pending.rows.some((row) => row.sent || row.done)) return;
+    const token = ++reannounceToken;
+    pending.title.textContent = 'Reconnected: putting the files back on the PC clipboard…';
+    const started = Date.now();
+    while (!gatewayStatus().clipboardReady) {
+      if (Date.now() - started > 90000) {
+        pending.title.textContent = 'Reconnected, but the PC clipboard is not ready: upload again';
+        return;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+      if (token !== reannounceToken || upload !== pending || !connected) return;
+    }
+    abandonPendingUpload();
+    try {
+      const { transferIds } = fileTransfer.uploadFiles(pending.files);
+      holdClipboard();
+      pending.byTransferId.clear();
+      for (const [fileIndex, transferId] of transferIds || []) {
+        pending.byTransferId.set(transferId, pending.pickedRows[fileIndex]);
+      }
+      gatewayNote('app: files announced again after reconnect');
+      updateUploadTitle();
+    } catch (error) {
+      for (const row of pending.pickedRows) failRow(row, String(error?.message || error).slice(0, 80));
+      pending.title.textContent = 'Could not put the files back after reconnecting: upload again';
+    }
   };
   // The clipboard changed (copied on the phone, or on the PC) before Windows
   // read the files: the PC's clipboard no longer holds them.
