@@ -680,9 +680,19 @@
     // The bar always shows the latest files copied on the PC.
     fileRows.clear();
     downloadsElement.replaceChildren();
+    // A copied image can arrive as a file list IronRDP misreads: dozens of
+    // entries with unprintable names and sizes of billions of GB. Keep only
+    // entries that look like real files.
+    const plausible = (file) => Number.isFinite(file.size) && file.size >= 0
+      && file.size < 2 ** 42
+      && typeof file.name === 'string' && file.name.length > 0
+      && !/[\u0000-\u001f\ufffd]/.test(file.name);
     const entries = files
       .map((file, index) => ({ file, index }))
-      .filter(({ file }) => !file.isDirectory);
+      .filter(({ file }) => !file.isDirectory && plausible(file));
+    if (entries.length < files.filter((file) => !file.isDirectory).length) {
+      console.warn(`file transfer: ignored ${files.length - entries.length} unreadable file entries`);
+    }
     if (!entries.length) {
       downloadsElement.hidden = true;
       return;
