@@ -7,13 +7,6 @@ import java.util.Locale;
  * Watches one relayed RDP session. It records, for diagnosing disconnects, the
  * virtual channel messages the client sent (with their chunk headers) and the
  * last bytes the server sent before the connection ended.
- *
- * It also repairs one thing in the client's stream: IronRDP marks every
- * clipboard chunk CHANNEL_FLAG_SHOW_PROTOCOL although it declares the cliprdr
- * channel without CHANNEL_OPTION_SHOW_PROTOCOL. Windows then hands chunked
- * clipboard messages over unassembled and drops the connection, so a file
- * paste over one chunk (1600 bytes) fails. The flag is cleared on the chunks
- * of multi-chunk cliprdr messages.
  */
 final class RdpTrace {
     private static final int IO_CHANNEL_GUESS = 1003;
@@ -28,7 +21,6 @@ final class RdpTrace {
     private byte[] pending = new byte[0];
     private int cliprdrIndex = -1;
     private int cliprdrChannel = -1;
-    private int repairedChunks;
 
     // The virtual channel message being chunked, if any.
     private int chunkChannel = -1;
@@ -38,38 +30,30 @@ final class RdpTrace {
     private int chunkMaxSize;
     private String chunkFlags = "";
 
-    /** Records (and repairs, in place) a message the client sends to the server. */
+    /** Records a message the client sends to the server. */
     synchronized void fromClient(byte[] message) {
         bytesUp += message.length;
         if (cliprdrIndex < 0) {
             cliprdrIndex = findClientChannel(message, "cliprdr");
         }
         if (pending.length > 0) {
-            // A PDU split across messages: record it, but repair only whole PDUs.
+            // A PDU split across messages.
             byte[] joined = new byte[pending.length + message.length];
             System.arraycopy(pending, 0, joined, 0, pending.length);
             System.arraycopy(message, 0, joined, pending.length, message.length);
-            parse(joined, pending.length, message);
+            parse(joined);
             return;
         }
-        parse(message, 0, message);
+        parse(message);
     }
 
-    private void parse(byte[] data, int messageStart, byte[] message) {
+    private void parse(byte[] data) {
         int offset = 0;
         while (offset < data.length) {
             int length = pduLength(data, offset);
             if (length <= 0) {
                 pending = new byte[0];
                 return;
-            }
-            // Repair as soon as the chunk header is here: the rest of the PDU
-            // may only come with the next message, after this one is sent.
-            if ((data[offset] & 0xFF) == 3 && offset + 4 <= data.length) {
-                int flagsAt = repair(data, offset, Math.min(data.length, offset + length));
-                if (flagsAt >= messageStart) {
-                    message[flagsAt - messageStart] = data[flagsAt];
-                }
             }
             if (offset + length > data.length) {
                 break;
@@ -80,32 +64,6 @@ final class RdpTrace {
             offset += length;
         }
         pending = java.util.Arrays.copyOfRange(data, offset, data.length);
-    }
-
-    /**
-     * Clears SHOW_PROTOCOL on a chunk of a multi-chunk cliprdr message whose
-     * header lies in {@code data[offset, end)}. Returns the flag byte's index if
-     * it changed it, or -1.
-     */
-    private int repair(byte[] data, int offset, int end) {
-        int mcs = offset + 7;
-        if (cliprdrChannel < 0 || mcs + 7 > end || (data[mcs] & 0xFF) != 0x64) {
-            return -1;
-        }
-        int channel = ((data[mcs + 3] & 0xFF) << 8) | (data[mcs + 4] & 0xFF);
-        int userData = mcs + 7 + (((data[mcs + 6] & 0xFF) & 0x80) != 0 ? 1 : 0);
-        int flagsAt = userData + 4;
-        if (channel != cliprdrChannel || flagsAt >= end) {
-            return -1;
-        }
-        int flags = data[flagsAt] & 0xFF;
-        boolean chunked = (flags & 0x03) != 0x03;
-        if (!chunked || (flags & 0x10) == 0) {
-            return -1;
-        }
-        data[flagsAt] = (byte) (flags & ~0x10);
-        repairedChunks += 1;
-        return flagsAt;
     }
 
     synchronized void fromServer(byte[] data, int count) {
@@ -128,7 +86,7 @@ final class RdpTrace {
         StringBuilder text = new StringBuilder();
         text.append("up ").append(bytesUp).append(" B, down ").append(bytesDown).append(" B")
             .append(", cliprdr ch").append(cliprdrChannel)
-            .append(", repaired ").append(repairedChunks).append(" chunks");
+;
         if (chunkChannel >= 0) {
             text.append("; unfinished ").append(describeChunks());
         }
@@ -166,12 +124,11 @@ final class RdpTrace {
         return -1;
     }
 
-    /** Returns the index of a flag byte it changed, or -1. */
-    private int slowPath(byte[] data, int offset, int length) {
+    private void slowPath(byte[] data, int offset, int length) {
         // TPKT (4) + X.224 data TPDU (3) + MCS Send Data Request.
         int mcs = offset + 7;
         if (length < 16 || (data[mcs] & 0xFF) != 0x64) {
-            return -1;
+            return;
         }
         int channel = ((data[mcs + 3] & 0xFF) << 8) | (data[mcs + 4] & 0xFF);
         int lengthByte = data[mcs + 6] & 0xFF;
@@ -180,7 +137,7 @@ final class RdpTrace {
             userData += 1;
         }
         if (channel == IO_CHANNEL_GUESS || userData + 8 > offset + length) {
-            return -1;
+            return;
         }
         long total = le32(data, userData);
         long flags = le32(data, userData + 4);
@@ -198,10 +155,9 @@ final class RdpTrace {
             chunkMaxSize = 0;
             chunkFlags = "";
         }
-        int changed = -1;
         if (chunkChannel != channel) {
             add(String.format(Locale.US, "ch%d stray chunk flags=%x len=%d size=%d", channel, flags, total, size));
-            return changed;
+            return;
         }
         chunkSum += size;
         chunkCount += 1;
@@ -218,7 +174,6 @@ final class RdpTrace {
             }
             chunkChannel = -1;
         }
-        return changed;
     }
 
     /**

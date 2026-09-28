@@ -81,6 +81,8 @@ final class RdpGateway {
     // Cloudflare closes idle WebSockets after about 100 s; an idle or
     // backgrounded remote desktop sends nothing, so the tunnels are pinged.
     private static final long TUNNEL_PING_SECONDS = 20L;
+    /** Largest WebSocket frame sent into the Cloudflare tunnel. */
+    private static final int TUNNEL_FRAME_BYTES = 4 * 1024;
     private final Set<AccessWebSocket> openTunnels = ConcurrentHashMap.newKeySet();
 
     /** Opens the content of a file picked on the device. */
@@ -749,8 +751,10 @@ final class RdpGateway {
             byte[] buffer = new byte[32 * 1024];
             try (InputStream input = socket.getInputStream()) {
                 for (int count = input.read(buffer); count >= 0; count = input.read(buffer)) {
-                    if (count > 0) {
-                        tunnel.sendBinary(buffer, 0, count);
+                    // Small frames: large ones (a file pasted from the phone)
+                    // made the Cloudflare tunnel drop the connection.
+                    for (int sent = 0; sent < count; sent += TUNNEL_FRAME_BYTES) {
+                        tunnel.sendBinary(buffer, sent, Math.min(TUNNEL_FRAME_BYTES, count - sent));
                     }
                 }
             } catch (IOException exception) {
