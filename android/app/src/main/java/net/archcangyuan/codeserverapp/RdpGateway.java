@@ -797,6 +797,10 @@ final class RdpGateway {
             return "app side: " + describe(exception);
         }
         Object writeLock = new Object();
+        // The page stops reading while the app is in the background. Data from
+        // the PC is queued here instead of blocking: a stalled reader would stop
+        // the Cloudflare tunnel from being read, and the tunnel then drops.
+        DownstreamQueue queue = new DownstreamQueue();
         Thread downstream = new Thread(() -> {
             byte[] buffer = new byte[32 * 1024];
             try (InputStream input = tls.getInputStream()) {
@@ -811,18 +815,38 @@ final class RdpGateway {
                                 output.flush();
                             }
                         }
-                        client.sendBinary(buffer, 0, count);
+                        if (!queue.offer(java.util.Arrays.copyOf(buffer, count))) {
+                            ended.compareAndSet(null, "the app stopped reading ("
+                                + (DownstreamQueue.LIMIT_BYTES >> 20) + " MB queued from the PC)");
+                            break;
+                        }
                     }
                 }
                 ended.compareAndSet(null, "server closed the connection");
             } catch (IOException exception) {
                 ended.compareAndSet(null, "server side: " + describe(exception));
             } finally {
-                client.close();
+                queue.finish();
             }
         }, "RdpGateway-relay-down");
+        Thread deliver = new Thread(() -> {
+            try {
+                for (byte[] data = queue.take(); data != null; data = queue.take()) {
+                    client.sendBinary(data, 0, data.length);
+                }
+            } catch (IOException exception) {
+                ended.compareAndSet(null, "app side: " + describe(exception));
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+            } finally {
+                client.close();
+                closeQuietly(tls);
+            }
+        }, "RdpGateway-relay-deliver");
         downstream.setDaemon(true);
+        deliver.setDaemon(true);
         downstream.start();
+        deliver.start();
         try {
             for (byte[] message = client.readMessage(); message != null; message = client.readMessage()) {
                 byte[] forward = trace.fromClient(message);
@@ -914,6 +938,43 @@ final class RdpGateway {
     }
 
     /** Presents the tunnel's WebSocket messages as a byte stream. */
+    /** Byte chunks from the PC waiting for the page, bounded by total size. */
+    private static final class DownstreamQueue {
+        static final long LIMIT_BYTES = 96L * 1024 * 1024;
+
+        private final java.util.ArrayDeque<byte[]> chunks = new java.util.ArrayDeque<>();
+        private long queuedBytes;
+        private boolean finished;
+
+        /** Queues a chunk; false when the page has fallen too far behind. */
+        synchronized boolean offer(byte[] chunk) {
+            if (queuedBytes + chunk.length > LIMIT_BYTES) {
+                return false;
+            }
+            chunks.addLast(chunk);
+            queuedBytes += chunk.length;
+            notifyAll();
+            return true;
+        }
+
+        synchronized void finish() {
+            finished = true;
+            notifyAll();
+        }
+
+        /** The next chunk, or null once finished and drained. */
+        synchronized byte[] take() throws InterruptedException {
+            while (chunks.isEmpty() && !finished) {
+                wait();
+            }
+            byte[] chunk = chunks.pollFirst();
+            if (chunk != null) {
+                queuedBytes -= chunk.length;
+            }
+            return chunk;
+        }
+    }
+
     private static final class TunnelInputStream extends InputStream {
         private final AccessWebSocket tunnel;
         private byte[] current = new byte[0];
