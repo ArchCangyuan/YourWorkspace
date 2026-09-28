@@ -209,6 +209,9 @@
       return {};
     }
   };
+  const gatewayNote = (text) => {
+    try { nativeBridge?.gatewayNote?.(sessionToken, text); } catch (_) {}
+  };
   const shortReason = (text) => String(text || '')
     .replace(/\[[^\]]*@ [^\]]*\]\s*/g, '')
     .slice(0, 160);
@@ -345,13 +348,18 @@
   const rendererCanvas = () => element.shadowRoot?.querySelector('canvas') || null;
 
   // The page scales the desktop itself: it fills the available area once the
-  // server applies a size, and keeps its scale (anchored top left) while a
+  // server applies a size, and fills the width (anchored top left) while a
   // resize is pending instead of shrinking the old frame to fit.
   const fitDisplay = () => {
     const canvas = rendererCanvas();
     if (!canvas || !canvas.width || !canvas.height) return;
     const available = availableSize();
-    const scale = Math.max(canvas.width / available.width, canvas.height / available.height);
+    // While a resize is pending the frame has the old aspect: fill the width
+    // (the keyboard may cover the bottom for a moment) instead of shrinking
+    // it into a black-edged box.
+    const scale = resizeInFlight
+      ? canvas.width / available.width
+      : Math.max(canvas.width / available.width, canvas.height / available.height);
     element.style.setProperty('--rdp-width', `${canvas.width / scale}px`);
     element.style.setProperty('--rdp-height', `${canvas.height / scale}px`);
   };
@@ -390,6 +398,8 @@
     if (changedWhileInFlight) {
       changedWhileInFlight = false;
       syncDesktopSize();
+    } else {
+      fitDisplay();
     }
   };
 
@@ -893,6 +903,7 @@
     row.state.title = message;
   };
   window.__rdpUploadFromApp = async (items) => {
+    gatewayNote(`app: upload of ${items.length} file(s) started`);
     window.clearTimeout(uploadHideTimer);
     abandonPendingUpload();
     lastClipboardWarning = '';
@@ -903,7 +914,10 @@
     paste.textContent = 'Paste';
     paste.title = 'Send Ctrl+V to Windows';
     paste.hidden = true;
-    paste.addEventListener('click', () => ui?.ctrlV?.());
+    paste.addEventListener('click', () => {
+      gatewayNote('app: Paste pressed (Ctrl+V sent)');
+      ui?.ctrlV?.();
+    });
     const close = document.createElement('button');
     close.className = 'plain';
     close.textContent = '✕';

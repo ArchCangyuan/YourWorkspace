@@ -195,6 +195,13 @@ final class RdpGateway {
         return token;
     }
 
+    void note(String sessionToken, String text) {
+        RdpTrace trace = sessionTraces.get(sessionToken);
+        if (trace != null && text != null) {
+            trace.note(text);
+        }
+    }
+
     /**
      * Describes the latest connection attempt of a session as JSON: the stage
      * it reached ({@code tunnel}, {@code negotiate}, {@code tls}, {@code relay})

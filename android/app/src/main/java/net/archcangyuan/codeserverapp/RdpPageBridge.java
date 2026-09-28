@@ -88,6 +88,15 @@ final class RdpPageBridge {
         return current == null || !sessions.containsKey(gatewayToken) ? "{}" : current.status(gatewayToken);
     }
 
+    /** Adds a timestamped line from the page to the gateway's clipboard log. */
+    @JavascriptInterface
+    public void gatewayNote(String gatewayToken, String text) {
+        RdpGateway current = gateway;
+        if (current != null && sessions.containsKey(gatewayToken)) {
+            current.note(gatewayToken, text);
+        }
+    }
+
     /** Switches a gateway clipboard rewrite; see {@link RdpTrace#setOption}. */
     @JavascriptInterface
     public boolean gatewayOption(String gatewayToken, String name, boolean value) {

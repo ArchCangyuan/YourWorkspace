@@ -376,6 +376,15 @@ final class RdpTrace {
     }
 
     /** The recent clipboard messages, one per line. */
+    /** A timestamped line from the page (e.g. when Paste was pressed). */
+    synchronized void note(String text) {
+        String line = text.length() > 120 ? text.substring(0, 120) : text;
+        clipEvents.addLast(String.format(Locale.US, "%tT.%<tL %s", System.currentTimeMillis(), line));
+        while (clipEvents.size() > MAX_CLIP_EVENTS) {
+            clipEvents.removeFirst();
+        }
+    }
+
     synchronized String clipboardLog() {
         return String.join("\n", clipEvents);
     }
