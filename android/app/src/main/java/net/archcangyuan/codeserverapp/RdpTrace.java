@@ -53,13 +53,31 @@ final class RdpTrace {
      * again after Monitor Ready; given both, the PC's rdpclip answers once and
      * then stops answering the clipboard channel altogether.
      */
+    /** Clipboard rewrites, switchable from the page for diagnosis. */
+    static volatile boolean addFileContents = false;
+    static volatile boolean clearClipDataLocking = true;
+
+    static boolean setOption(String name, boolean value) {
+        switch (name) {
+            case "addFileContents":
+                addFileContents = value;
+                return true;
+            case "clearClipDataLocking":
+                clearClipDataLocking = value;
+                return true;
+            default:
+                return false;
+        }
+    }
+
     synchronized byte[] fromClient(byte[] message) {
         byte[] forward = message;
         if (clientSynced && pending.length == 0 && cliprdrChannel >= 0) {
             if (monitorReadyCount == 0) {
                 forward = withoutEarlyClipboard(message);
             } else {
-                forward = withoutClipDataLocking(withFileContentsFormat(message));
+                forward = addFileContents ? withFileContentsFormat(message) : message;
+                forward = clearClipDataLocking ? withoutClipDataLocking(forward) : forward;
             }
         }
         record(forward);

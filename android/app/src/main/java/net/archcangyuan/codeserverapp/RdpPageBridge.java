@@ -88,6 +88,12 @@ final class RdpPageBridge {
         return current == null || !sessions.containsKey(gatewayToken) ? "{}" : current.status(gatewayToken);
     }
 
+    /** Switches a gateway clipboard rewrite; see {@link RdpTrace#setOption}. */
+    @JavascriptInterface
+    public boolean gatewayOption(String gatewayToken, String name, boolean value) {
+        return sessions.containsKey(gatewayToken) && RdpTrace.setOption(name, value);
+    }
+
     @JavascriptInterface
     public String clipboardText() {
         FutureTask<String> read = new FutureTask<>(() -> {
