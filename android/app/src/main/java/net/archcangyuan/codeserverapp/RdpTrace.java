@@ -85,11 +85,10 @@ final class RdpTrace {
     }
 
     /**
-     * IronRDP announces uploaded files as FileGroupDescriptorW and Preferred
-     * DropEffect only. The PC's rdpclip puts just the listed formats on the
-     * Windows clipboard, and Explorer only offers Paste for a file descriptor
-     * that comes with FileContents (checked on the PC: Paste stayed disabled
-     * with exactly those formats). Adds a FileContents entry to such lists.
+     * Adds a FileContents entry to file lists (FileGroupDescriptorW and
+     * Preferred DropEffect only). Off by default: Windows left such lists
+     * unanswered, while the plain list pastes fine once clipboard locking is
+     * off (checked on the PC, 2026-09-28).
      */
     private byte[] withFileContentsFormat(byte[] message) {
         java.io.ByteArrayOutputStream out = null;
