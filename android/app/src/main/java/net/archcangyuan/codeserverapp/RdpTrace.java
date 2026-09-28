@@ -56,7 +56,7 @@ final class RdpTrace {
     /** Clipboard rewrites, switchable from the page for diagnosis. */
     static volatile boolean addFileContents = false;
     static volatile boolean clearClipDataLocking = false;
-    static volatile boolean excludeFromClipboardHistory = true;
+    static volatile boolean excludeFromClipboardHistory = false;
 
     static boolean setOption(String name, boolean value) {
         switch (name) {
@@ -99,13 +99,12 @@ final class RdpTrace {
      *
      * FileContents: off by default, Windows left such lists unanswered.
      *
-     * ExcludeClipboardContentFromMonitorProcessing: on by default. Windows'
-     * clipboard history service reads every new clipboard entry; on the
-     * files announced from the phone it hung together with Explorer and the
-     * PC's rdpclip until that service was restarted (killing rdpclip alone
-     * did not help). The format tells clipboard monitors to skip the entry.
-     * Its data is never needed; IronRDP answers a request for it with an
-     * error response.
+     * ExcludeClipboardContentFromMonitorProcessing: off by default. Meant to
+     * keep Windows' clipboard history away from the phone's files, but like
+     * FileContents it made the PC stop answering the file list (tested on
+     * the PC, 2026-09-28).
+     *
+     * Any format added to the file list so far stalled the PC's clipboard.
      */
     private byte[] withExtraFileListFormat(byte[] message, int formatId, String formatName) {
         java.io.ByteArrayOutputStream out = null;
