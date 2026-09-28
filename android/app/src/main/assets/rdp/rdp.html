@@ -755,6 +755,16 @@
   // the remote clipboard. Windows reads them when they are pasted (Ctrl+V);
   // the bar shows both phases with progress bars.
   const uploadsElement = document.getElementById('uploads');
+  // Buttons in the transfer bars must not take keyboard focus: IronRDP only
+  // forwards keys while its canvas is focused.
+  for (const bar of [downloadsElement, uploadsElement]) {
+    bar.addEventListener('pointerdown', (event) => {
+      if (event.target.closest('button')) event.preventDefault();
+    });
+    bar.addEventListener('click', () => {
+      if (document.activeElement?.closest?.('#downloads, #uploads')) rendererCanvas()?.focus();
+    });
+  }
   let upload = null;
   let uploadHideTimer = 0;
   // Warnings the IronRDP clipboard code logs (e.g. the server does not allow

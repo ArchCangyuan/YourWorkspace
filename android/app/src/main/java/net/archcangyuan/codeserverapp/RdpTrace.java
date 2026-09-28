@@ -59,7 +59,7 @@ final class RdpTrace {
             if (monitorReadyCount == 0) {
                 forward = withoutEarlyClipboard(message);
             } else {
-                forward = withFileContentsFormat(message);
+                forward = withoutClipDataLocking(withFileContentsFormat(message));
             }
         }
         record(forward);
@@ -102,6 +102,43 @@ final class RdpTrace {
         clipEvents.addLast(String.format(Locale.US,
             "%tT.%<tL gateway added FileContents to the file list", System.currentTimeMillis()));
         return out.toByteArray();
+    }
+
+    /**
+     * Clears CAN_LOCK_CLIPDATA in the client's clipboard capabilities. With
+     * locking negotiated the PC locks the phone's first (text) format list and
+     * then left every later file list unanswered; without it rdpclip asks for
+     * file contents without a lock id, which IronRDP serves from the current
+     * file list.
+     */
+    private byte[] withoutClipDataLocking(byte[] message) {
+        byte[] result = message;
+        int offset = 0;
+        while (offset < result.length) {
+            int length = pduLength(result, offset);
+            if (length <= 0 || offset + length > result.length) {
+                break;
+            }
+            int mcs = offset + 7;
+            if ((result[offset] & 0xFF) == 3 && isClipboardPdu(result, offset, length)) {
+                int userData = mcs + 7 + (((result[mcs + 6] & 0xFF) & 0x80) != 0 ? 1 : 0);
+                int body = userData + 8;
+                if (body + 24 <= offset + length
+                    && (le32(result, userData + 4) & 0x3) == 0x3
+                    && (result[body] & 0xFF) == 7 && result[body + 1] == 0
+                    && (result[body + 12] & 0xFF) == 1 && result[body + 13] == 0
+                    && (result[body + 20] & 0x10) != 0) {
+                    if (result == message) {
+                        result = message.clone();
+                    }
+                    result[body + 20] &= ~0x10;
+                    clipEvents.addLast(String.format(Locale.US,
+                        "%tT.%<tL gateway turned off clipboard locking", System.currentTimeMillis()));
+                }
+            }
+            offset += length;
+        }
+        return result;
     }
 
     private static final int FILE_CONTENTS_FORMAT_ID = 0xC0FC;
@@ -387,6 +424,8 @@ final class RdpTrace {
         } else if (type == 5 && dataLength == 4 && field + 4 <= end) {
             // A 4-byte answer is the Preferred DropEffect value (1 = copy).
             line.append(" value=").append(le32(data, field));
+        } else if (type == 7 && field + 16 <= end) {
+            line.append(" flags=0x").append(Long.toHexString(le32(data, field + 12)));
         } else if (type == 2 && dataLength > 0) {
             line.append(" formats=").append(formatNames(data, field, (int) Math.min(end, field + dataLength)));
         }
