@@ -364,7 +364,7 @@
     if (recentRequests.length > 8) recentRequests.shift();
     ui.resize(size.width, size.height);
     window.clearTimeout(pendingFitTimer);
-    pendingFitTimer = window.setTimeout(catchUp, 4000);
+    pendingFitTimer = window.setTimeout(catchUp, 1500);
   };
   // A frame still not at the requested size a while after the last request
   // (a dropped or overtaken resize): ask again, a few times.
@@ -376,29 +376,20 @@
       catchUpAttempts = 0;
       return;
     }
-    if (catchUpAttempts >= 3) return;
+    if (catchUpAttempts >= 5) return;
     catchUpAttempts += 1;
     requestSize(desktopSize());
   }
 
   const rendererCanvas = () => element.shadowRoot?.querySelector('canvas') || null;
 
-  // The page scales the desktop itself: it fills the available area once the
-  // server applies a size, and fills the width (anchored top left) while a
-  // resize is pending instead of shrinking the old frame to fit.
+  // The page scales the desktop itself: the whole frame, as large as fits.
   const fitDisplay = () => {
     const canvas = rendererCanvas();
     if (!canvas || !canvas.width || !canvas.height) return;
     const available = availableSize();
-    // Until the server applies the requested size the frame has the old
-    // aspect: cover the whole area (cropping an edge for a moment) instead of
-    // leaving a black strip, e.g. where the keyboard was. A server that has
-    // not followed after 15 s gets its frame fitted.
-    const pending = connectedSize && Date.now() - lastResizeAt < 15000
-      && !sameSize({ width: canvas.width, height: canvas.height }, connectedSize);
-    const scale = resizeInFlight || pending
-      ? Math.min(canvas.width / available.width, canvas.height / available.height)
-      : Math.max(canvas.width / available.width, canvas.height / available.height);
+    // Always show the whole frame; a new size follows quickly instead.
+    const scale = Math.max(canvas.width / available.width, canvas.height / available.height);
     element.style.setProperty('--rdp-width', `${canvas.width / scale}px`);
     element.style.setProperty('--rdp-height', `${canvas.height / scale}px`);
   };
@@ -469,18 +460,19 @@
         return;
       }
       // The server answered with another size (e.g. capped): act on it now.
-      // Otherwise wait for it, up to 2.5 s.
+      // Otherwise wait for it, up to 1.2 s.
       const stale = applied && isStaleAnswer(applied, requested);
       const responded = applied && !stale
         && (!before || applied.width !== before.width || applied.height !== before.height);
-      if (!responded && Date.now() - started < 2500) {
-        checkTimer = window.setTimeout(poll, 100);
+      if (!responded && Date.now() - started < 1200) {
+        checkTimer = window.setTimeout(poll, 50);
         return;
       }
       fitDisplay();
       if (!responded && resends > 0) {
         // Windows drops a resize that arrives while it is still applying one:
-        // ask again for the current size instead of staying at a stale one.
+        // ask again (after 1.2 s) for the current size instead of staying at
+        // a stale one.
         const size = desktopSize();
         connectedSize = size;
         try {
@@ -524,7 +516,7 @@
       }
       checkAppliedSize(size, retries - 1);
     };
-    checkTimer = window.setTimeout(poll, 100);
+    checkTimer = window.setTimeout(poll, 50);
   };
 
   const errorKindNames = [
