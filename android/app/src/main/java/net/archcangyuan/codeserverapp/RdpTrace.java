@@ -25,6 +25,14 @@ final class RdpTrace {
     private byte[] serverPending = new byte[0];
     private final ArrayDeque<String> clipEvents = new ArrayDeque<>();
     private static final int MAX_CLIP_EVENTS = 40;
+    // IronRDP's clipboard Capabilities and Temporary Directory PDUs, kept to
+    // replay when the PC's clipboard service (rdpclip) restarts: IronRDP
+    // answers a later Monitor Ready without them, and without the client's
+    // file-stream capability the PC never offers uploaded files for pasting.
+    private byte[] clientCapabilities;
+    private byte[] clientTempDirectory;
+    private int monitorReadyCount;
+    private byte[] pendingReplay;
 
     // The virtual channel message being chunked, if any.
     private int chunkChannel = -1;
@@ -127,6 +135,21 @@ final class RdpTrace {
         return text.toString();
     }
 
+    /**
+     * PDUs to send the server before forwarding what it just sent (the
+     * client's clipboard capabilities after an rdpclip restart), or null.
+     */
+    synchronized byte[] takeReplay() {
+        byte[] replay = pendingReplay;
+        pendingReplay = null;
+        if (replay != null) {
+            clipEvents.addLast(String.format(Locale.US,
+                "%tT.%<tL gateway replayed Capabilities + TempDirectory (PC clipboard restarted)",
+                System.currentTimeMillis()));
+        }
+        return replay;
+    }
+
     /** The recent clipboard messages, one per line. */
     synchronized String clipboardLog() {
         return String.join("\n", clipEvents);
@@ -151,6 +174,26 @@ final class RdpTrace {
         }
         int body = userData + 8;
         int type = (data[body] & 0xFF) | ((data[body + 1] & 0xFF) << 8);
+        boolean whole = (chunkFlags & 0x3) == 0x3;
+        if (mcsChoice == 0x64 && whole && (type == 7 || type == 6)) {
+            byte[] pdu = java.util.Arrays.copyOfRange(data, offset, end);
+            if (type == 7) {
+                clientCapabilities = pdu;
+            } else {
+                clientTempDirectory = pdu;
+            }
+        } else if (mcsChoice == 0x68 && type == 1) {
+            monitorReadyCount += 1;
+            if (monitorReadyCount > 1 && clientCapabilities != null) {
+                int size = clientCapabilities.length
+                    + (clientTempDirectory == null ? 0 : clientTempDirectory.length);
+                pendingReplay = java.util.Arrays.copyOf(clientCapabilities, size);
+                if (clientTempDirectory != null) {
+                    System.arraycopy(clientTempDirectory, 0, pendingReplay,
+                        clientCapabilities.length, clientTempDirectory.length);
+                }
+            }
+        }
         int flags = (data[body + 2] & 0xFF) | ((data[body + 3] & 0xFF) << 8);
         long dataLength = le32(data, body + 4);
         StringBuilder line = new StringBuilder(String.format(

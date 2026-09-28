@@ -781,12 +781,27 @@ final class RdpGateway {
     private static String relay(AccessWebSocket client, SSLSocket tls, RdpTrace trace) {
         java.util.concurrent.atomic.AtomicReference<String> ended =
             new java.util.concurrent.atomic.AtomicReference<>();
+        OutputStream output;
+        try {
+            output = tls.getOutputStream();
+        } catch (IOException exception) {
+            return "app side: " + describe(exception);
+        }
+        Object writeLock = new Object();
         Thread downstream = new Thread(() -> {
             byte[] buffer = new byte[32 * 1024];
             try (InputStream input = tls.getInputStream()) {
                 for (int count = input.read(buffer); count >= 0; count = input.read(buffer)) {
                     if (count > 0) {
                         trace.fromServer(buffer, count);
+                        byte[] replay = trace.takeReplay();
+                        if (replay != null) {
+                            // Ahead of IronRDP's answer to the server's Monitor Ready.
+                            synchronized (writeLock) {
+                                output.write(replay);
+                                output.flush();
+                            }
+                        }
                         client.sendBinary(buffer, 0, count);
                     }
                 }
@@ -800,11 +815,12 @@ final class RdpGateway {
         downstream.setDaemon(true);
         downstream.start();
         try {
-            OutputStream output = tls.getOutputStream();
             for (byte[] message = client.readMessage(); message != null; message = client.readMessage()) {
                 trace.fromClient(message);
-                output.write(message);
-                output.flush();
+                synchronized (writeLock) {
+                    output.write(message);
+                    output.flush();
+                }
             }
             ended.compareAndSet(null, "app closed the connection");
         } catch (IOException exception) {
