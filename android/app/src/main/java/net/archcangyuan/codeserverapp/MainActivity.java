@@ -20,6 +20,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.IBinder;
 import android.os.Looper;
 import android.os.Message;
 import android.os.PowerManager;
@@ -1849,37 +1850,6 @@ public final class MainActivity extends Activity {
             return true;
           };
 
-          // Keyboard locked open on a remote desktop page: Chromium hides the
-          // keyboard whenever a tap lands on something it cannot type into,
-          // such as the IronRDP canvas, and the app then brings it back (a
-          // visible flash). Marked editable, the canvas keeps it up; typing
-          // still goes through the app's own input connection to IronRDP.
-          let keyboardHeldOpen = false;
-          const applyKeyboardHeldOpen = () => {
-            if (!window.__yourWorkspaceRdpPage) return;
-            const canvas = findIronRdpCanvas();
-            if (!canvas) return;
-            if (keyboardHeldOpen) {
-              if (canvas.getAttribute('contenteditable') !== 'true') {
-                canvas.setAttribute('contenteditable', 'true');
-                canvas.setAttribute('spellcheck', 'false');
-                canvas.style.caretColor = 'transparent';
-                canvas.style.outline = 'none';
-              }
-            } else if (canvas.hasAttribute('contenteditable')) {
-              canvas.removeAttribute('contenteditable');
-            }
-          };
-          // The canvas is replaced on reconnect: re-apply before each touch.
-          document.addEventListener('pointerdown', () => {
-            if (keyboardHeldOpen) applyKeyboardHeldOpen();
-          }, true);
-          const setKeyboardHeldOpen = (held) => {
-            keyboardHeldOpen = held;
-            applyKeyboardHeldOpen();
-            return true;
-          };
-
           const bridge = {
             version: 17,
             forceKeyboard,
@@ -1901,9 +1871,6 @@ public final class MainActivity extends Activity {
             },
             setKeyboardLocked(locked) {
               return setKeyboardLocked(Boolean(locked));
-            },
-            setKeyboardHeldOpen(held) {
-              return setKeyboardHeldOpen(Boolean(held));
             },
             setModifiers(control, shift) {
               const nextControl = Boolean(control);
@@ -4509,10 +4476,8 @@ public final class MainActivity extends Activity {
             "window.__codeServerAppKeyboard"
                 + " && typeof window.__codeServerAppKeyboard.setMouseMode === 'function'"
                 + " ? (window.__codeServerAppKeyboard.setKeyboardLocked?.(%b),"
-                + " window.__codeServerAppKeyboard.setKeyboardHeldOpen?.(%b),"
                 + " window.__codeServerAppKeyboard.setMouseMode(%b, %.2f)) : false",
             lock == KEYBOARD_LOCKED_HIDDEN,
-            lock == KEYBOARD_LOCKED_OPEN,
             target == webView ? mouseModeEnabled : mouseModeFor(sessionKeyOf(target)),
             widthDp
         );
@@ -4832,6 +4797,71 @@ public final class MainActivity extends Activity {
             if (inputMethodManager != null) {
                 inputMethodManager.restartInput(this);
             }
+        }
+
+        /**
+         * A keyboard locked open on the built-in remote desktop must not be
+         * closed by the page: Chromium hides it whenever a tap lands on the
+         * (non-editable) IronRDP canvas, and bringing it back flashes.
+         */
+        private boolean holdingKeyboard() {
+            return keyboardLock == KEYBOARD_LOCKED_OPEN && isBuiltInRemoteDesktop();
+        }
+
+        /**
+         * InputMethodManager.hideSoftInputFromWindow only hides when the
+         * focused view's window token matches the one given. While the
+         * keyboard is held, that one check gets no token, so Chromium's hide
+         * request is ignored. Every other caller gets the real token.
+         */
+        @Override
+        public IBinder getWindowToken() {
+            IBinder token = super.getWindowToken();
+            if (token != null && holdingKeyboard() && calledFromImeHide()) {
+                return null;
+            }
+            return token;
+        }
+
+        private boolean calledFromImeHide() {
+            for (StackTraceElement frame : new Throwable().getStackTrace()) {
+                if ("hideSoftInputFromWindow".equals(frame.getMethodName())
+                    && frame.getClassName().startsWith("android.view.inputmethod.InputMethodManager")) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /** Newer Chromium hides the keyboard through the insets controller. */
+        @Override
+        public WindowInsetsController getWindowInsetsController() {
+            WindowInsetsController controller = super.getWindowInsetsController();
+            if (controller == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+                return controller;
+            }
+            return (WindowInsetsController) java.lang.reflect.Proxy.newProxyInstance(
+                WindowInsetsController.class.getClassLoader(),
+                new Class<?>[] { WindowInsetsController.class },
+                (proxy, method, args) -> {
+                    if ("hide".equals(method.getName())
+                        && args != null && args.length == 1
+                        && args[0] instanceof Integer
+                        && (((Integer) args[0]) & WindowInsets.Type.ime()) != 0
+                        && holdingKeyboard()) {
+                        int others = ((Integer) args[0]) & ~WindowInsets.Type.ime();
+                        if (others != 0) {
+                            controller.hide(others);
+                        }
+                        return null;
+                    }
+                    try {
+                        return method.invoke(controller, args);
+                    } catch (java.lang.reflect.InvocationTargetException exception) {
+                        throw exception.getCause();
+                    }
+                }
+            );
         }
 
         @Override
