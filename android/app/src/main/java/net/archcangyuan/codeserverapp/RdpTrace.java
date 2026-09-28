@@ -55,7 +55,7 @@ final class RdpTrace {
      */
     /** Clipboard rewrites, switchable from the page for diagnosis. */
     static volatile boolean addFileContents = false;
-    static volatile boolean clearClipDataLocking = true;
+    static volatile boolean clearClipDataLocking = false;
 
     static boolean setOption(String name, boolean value) {
         switch (name) {
@@ -122,11 +122,9 @@ final class RdpTrace {
     }
 
     /**
-     * Clears CAN_LOCK_CLIPDATA in the client's clipboard capabilities. With
-     * locking negotiated the PC locks the phone's first (text) format list and
-     * then left every later file list unanswered; without it rdpclip asks for
-     * file contents without a lock id, which IronRDP serves from the current
-     * file list.
+     * Clears CAN_LOCK_CLIPDATA in the client's clipboard capabilities. Off by
+     * default: Microsoft's clients keep locking, and without it rdpclip still
+     * stopped answering file lists at times.
      */
     private byte[] withoutClipDataLocking(byte[] message) {
         byte[] result = message;
