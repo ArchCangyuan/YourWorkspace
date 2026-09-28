@@ -215,6 +215,7 @@ final class RdpGateway {
             status.put("relayEnd", sessionRelayEnds.getOrDefault(sessionToken, ""));
             RdpTrace trace = sessionTraces.get(sessionToken);
             status.put("clipboard", trace == null ? "" : trace.clipboardLog());
+            status.put("fileListWaitMs", trace == null ? 0 : trace.fileListWaitMs());
         } catch (org.json.JSONException ignored) {
             // Fields are plain strings.
         }

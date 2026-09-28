@@ -345,6 +345,15 @@
   let resizeInFlight = false;
   let changedWhileInFlight = false;
 
+  let lastResizeAt = 0;
+  let pendingFitTimer = 0;
+  const resizeDesktop = (size) => {
+    lastResizeAt = Date.now();
+    ui.resize(size.width, size.height);
+    window.clearTimeout(pendingFitTimer);
+    pendingFitTimer = window.setTimeout(() => fitDisplay(), 10100);
+  };
+
   const rendererCanvas = () => element.shadowRoot?.querySelector('canvas') || null;
 
   // The page scales the desktop itself: it fills the available area once the
@@ -354,10 +363,14 @@
     const canvas = rendererCanvas();
     if (!canvas || !canvas.width || !canvas.height) return;
     const available = availableSize();
-    // While a resize is pending the frame has the old aspect: fill the width
-    // (the keyboard may cover the bottom for a moment) instead of shrinking
-    // it into a black-edged box.
-    const scale = resizeInFlight
+    // Until the server applies the requested size the frame has the old
+    // aspect: fill the width (the keyboard may cover the bottom for a moment)
+    // instead of shrinking it into a black-edged box. A server that has not
+    // followed after 10 s gets its frame fitted.
+    const pending = connectedSize && Date.now() - lastResizeAt < 10000
+      && (Math.abs(canvas.width - connectedSize.width) > 2
+        || Math.abs(canvas.height - connectedSize.height) > 2);
+    const scale = resizeInFlight || pending
       ? canvas.width / available.width
       : Math.max(canvas.width / available.width, canvas.height / available.height);
     element.style.setProperty('--rdp-width', `${canvas.width / scale}px`);
@@ -384,7 +397,7 @@
     connectedSize = size;
     resizeInFlight = true;
     try {
-      ui.resize(size.width, size.height);
+      resizeDesktop(size);
     } catch (_) {
       resizeInFlight = false;
       fitDisplay();
@@ -443,7 +456,7 @@
         const size = desktopSize();
         connectedSize = size;
         try {
-          ui.resize(size.width, size.height);
+          resizeDesktop(size);
         } catch (_) {
           resizeSettled();
           return;
@@ -476,7 +489,7 @@
       }
       connectedSize = size;
       try {
-        ui.resize(size.width, size.height);
+        resizeDesktop(size);
       } catch (_) {
         resizeSettled();
         return;
@@ -1059,6 +1072,23 @@
         if (current === upload && refused() && !pickedRows.some((row) => row.sent)) failRefused();
       }, delay);
     }
+    // Windows' clipboard process (rdpclip) sometimes stops answering: say so
+    // instead of showing Ready for files the PC cannot paste yet.
+    let stalled = false;
+    const watchStall = () => {
+      if (current !== upload || upload.phase !== 'clipboard' || pickedRows.some((row) => row.sent)) return;
+      const waiting = Number(gatewayStatus().fileListWaitMs) || 0;
+      if (waiting > 7000 && !stalled) {
+        stalled = true;
+        gatewayNote(`app: PC has not answered the file list for ${Math.round(waiting / 1000)} s`);
+        current.title.textContent = 'Windows clipboard is not responding (rdpclip.exe): paste may not work';
+      } else if (!waiting && stalled) {
+        stalled = false;
+        updateUploadTitle();
+      }
+      window.setTimeout(watchStall, 2000);
+    };
+    window.setTimeout(watchStall, 2000);
   };
   // The clipboard changed (copied on the phone, or on the PC) before Windows
   // read the files: the PC's clipboard no longer holds them.

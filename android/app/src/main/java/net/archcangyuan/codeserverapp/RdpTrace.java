@@ -376,6 +376,14 @@ final class RdpTrace {
     }
 
     /** The recent clipboard messages, one per line. */
+    /** When the phone announced files that the PC has not answered yet, else 0. */
+    private long formatListSentAt;
+
+    /** How long the PC has left the phone's file list unanswered, in ms (0: not waiting). */
+    synchronized long fileListWaitMs() {
+        return formatListSentAt == 0 ? 0 : System.currentTimeMillis() - formatListSentAt;
+    }
+
     /** A timestamped line from the page (e.g. when Paste was pressed). */
     synchronized void note(String text) {
         String line = text.length() > 120 ? text.substring(0, 120) : text;
@@ -428,6 +436,9 @@ final class RdpTrace {
                 }
             }
         }
+        if (mcsChoice == 0x68 && type == 3) {
+            formatListSentAt = 0;
+        }
         int flags = (data[body + 2] & 0xFF) | ((data[body + 3] & 0xFF) << 8);
         long dataLength = le32(data, body + 4);
         StringBuilder line = new StringBuilder(String.format(
@@ -453,7 +464,11 @@ final class RdpTrace {
         } else if (type == 7 && field + 16 <= end) {
             line.append(" flags=0x").append(Long.toHexString(le32(data, field + 12)));
         } else if (type == 2 && dataLength > 0) {
-            line.append(" formats=").append(formatNames(data, field, (int) Math.min(end, field + dataLength)));
+            String formats = formatNames(data, field, (int) Math.min(end, field + dataLength));
+            line.append(" formats=").append(formats);
+            if (mcsChoice == 0x64) {
+                formatListSentAt = formats.contains("FileGroupDescriptorW") ? System.currentTimeMillis() : 0;
+            }
         }
         line.append(" len=").append(dataLength);
         if (total > 1600) {
