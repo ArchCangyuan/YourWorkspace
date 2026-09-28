@@ -14,6 +14,7 @@ import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.util.Base64;
 import java.util.Locale;
+import java.util.Map;
 
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
@@ -35,6 +36,7 @@ final class AccessWebSocket implements AutoCloseable {
 
     private static final String WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     private static final int CONNECT_TIMEOUT_MS = 15_000;
+    private volatile String closeReason = "";
     private static final int OPCODE_CONTINUATION = 0x0;
     private static final int OPCODE_TEXT = 0x1;
     private static final int OPCODE_BINARY = 0x2;
@@ -77,8 +79,8 @@ final class AccessWebSocket implements AutoCloseable {
         return new AccessWebSocket(socket, input, output, false);
     }
 
-    /** Opens {@code wss://host:443/} with the given Access token. */
-    static AccessWebSocket connect(String host, String accessToken) throws IOException {
+    /** Opens {@code wss://host:443/} with the given Access credential. */
+    static AccessWebSocket connect(String host, AccessCredential credential) throws IOException {
         Socket socket = new Socket();
         try {
             socket.connect(new InetSocketAddress(host, 443), CONNECT_TIMEOUT_MS);
@@ -88,7 +90,7 @@ final class AccessWebSocket implements AutoCloseable {
             parameters.setEndpointIdentificationAlgorithm("HTTPS");
             tlsSocket.setSSLParameters(parameters);
             tlsSocket.startHandshake();
-            return handshake(tlsSocket, host, accessToken);
+            return handshake(tlsSocket, host, credential);
         } catch (IOException | RuntimeException exception) {
             socket.close();
             throw exception;
@@ -96,20 +98,23 @@ final class AccessWebSocket implements AutoCloseable {
     }
 
     /** Opens a plain {@code ws://} connection; used by tests against a local server. */
-    static AccessWebSocket connectPlain(String host, int port, String accessToken)
+    static AccessWebSocket connectPlain(String host, int port, AccessCredential credential)
         throws IOException {
         Socket socket = new Socket();
         try {
             socket.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MS);
-            return handshake(socket, host + ":" + port, accessToken);
+            return handshake(socket, host + ":" + port, credential);
         } catch (IOException | RuntimeException exception) {
             socket.close();
             throw exception;
         }
     }
 
-    private static AccessWebSocket handshake(Socket socket, String hostHeader, String accessToken)
-        throws IOException {
+    private static AccessWebSocket handshake(
+        Socket socket,
+        String hostHeader,
+        AccessCredential credential
+    ) throws IOException {
         socket.setTcpNoDelay(true);
         socket.setSoTimeout(CONNECT_TIMEOUT_MS);
         InputStream input = new BufferedInputStream(socket.getInputStream());
@@ -118,16 +123,22 @@ final class AccessWebSocket implements AutoCloseable {
         byte[] keyBytes = new byte[16];
         new SecureRandom().nextBytes(keyBytes);
         String key = Base64.getEncoder().encodeToString(keyBytes);
-        String request = "GET / HTTP/1.1\r\n"
-            + "Host: " + hostHeader + "\r\n"
-            + "Upgrade: websocket\r\n"
-            + "Connection: Upgrade\r\n"
-            + "Sec-WebSocket-Key: " + key + "\r\n"
-            + "Sec-WebSocket-Version: 13\r\n"
-            + "Cf-Access-Token: " + accessToken + "\r\n"
-            + "User-Agent: YourWorkspace\r\n"
-            + "\r\n";
-        output.write(request.getBytes(StandardCharsets.US_ASCII));
+        StringBuilder request = new StringBuilder()
+            .append("GET / HTTP/1.1\r\n")
+            .append("Host: ").append(hostHeader).append("\r\n")
+            .append("Upgrade: websocket\r\n")
+            .append("Connection: Upgrade\r\n")
+            .append("Sec-WebSocket-Key: ").append(key).append("\r\n")
+            .append("Sec-WebSocket-Version: 13\r\n");
+        for (Map.Entry<String, String> header : credential.headers().entrySet()) {
+            String value = header.getValue();
+            if (value.indexOf('\r') >= 0 || value.indexOf('\n') >= 0) {
+                throw new IOException("Invalid Access credential");
+            }
+            request.append(header.getKey()).append(": ").append(value).append("\r\n");
+        }
+        request.append("User-Agent: YourWorkspace\r\n").append("\r\n");
+        output.write(request.toString().getBytes(StandardCharsets.UTF_8));
         output.flush();
 
         String statusLine = readLine(input);
@@ -154,7 +165,9 @@ final class AccessWebSocket implements AutoCloseable {
                 && location != null
                 && location.contains("/cdn-cgi/access/login");
             if (loginRedirect || status == 401 || status == 403) {
-                throw new LoginRequiredException("Cloudflare Access sign-in required");
+                throw new LoginRequiredException(credential.isServiceToken()
+                    ? "Cloudflare Access rejected the service token"
+                    : "Cloudflare Access sign-in required");
             }
             throw new IOException("Tunnel handshake failed: " + statusLine);
         }
@@ -209,13 +222,13 @@ final class AccessWebSocket implements AutoCloseable {
      * Connection Request through the tunnel and waits for the Connection
      * Confirm. Returns a short human-readable result.
      */
-    static String probeRemoteDesktop(String host, String accessToken) {
+    static String probeRemoteDesktop(String host, AccessCredential credential) {
         // TPKT + X.224 Connection Request with RDP_NEG_REQ (TLS | CredSSP).
         byte[] request = {
             0x03, 0x00, 0x00, 0x13, 0x0e, (byte) 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x01, 0x00, 0x08, 0x00, 0x03, 0x00, 0x00, 0x00
         };
-        try (AccessWebSocket tunnel = connect(host, accessToken)) {
+        try (AccessWebSocket tunnel = connect(host, credential)) {
             tunnel.setReadTimeout(10_000);
             tunnel.sendBinary(request, 0, request.length);
             byte[] response = tunnel.readMessage();
@@ -228,7 +241,9 @@ final class AccessWebSocket implements AutoCloseable {
             }
             return "Tunnel opened, but the answer is not RDP (" + response.length + " bytes).";
         } catch (LoginRequiredException exception) {
-            return "Cloudflare rejected the token: sign in again.";
+            return credential.isServiceToken()
+                ? "Cloudflare rejected the service token: check it and the app's policy."
+                : "Cloudflare rejected the token: sign in again.";
         } catch (java.net.SocketTimeoutException exception) {
             return "Tunnel opened, but the remote desktop did not answer within 10 s.";
         } catch (IOException exception) {
@@ -334,6 +349,12 @@ final class AccessWebSocket implements AutoCloseable {
             case OPCODE_PONG:
                 continue;
             case OPCODE_CLOSE:
+                closeReason = payload.length >= 2
+                    ? "close " + (((payload[0] & 0xFF) << 8) | (payload[1] & 0xFF))
+                        + (payload.length > 2
+                            ? " " + new String(payload, 2, payload.length - 2, StandardCharsets.UTF_8)
+                            : "")
+                    : "close";
                 return null;
             case OPCODE_TEXT:
             case OPCODE_BINARY:
@@ -377,6 +398,18 @@ final class AccessWebSocket implements AutoCloseable {
     /** Sets a read timeout in milliseconds for {@link #readMessage()}; 0 waits forever. */
     void setReadTimeout(int millis) throws IOException {
         socket.setSoTimeout(millis);
+    }
+
+    /** How the other side closed: its close code and reason, if it sent one. */
+    String closeReason() {
+        return closeReason;
+    }
+
+    /** Records why reading from this WebSocket stopped, unless a close frame said so. */
+    void noteClose(String reason) {
+        if (closeReason.isEmpty()) {
+            closeReason = reason;
+        }
     }
 
     boolean isClosed() {

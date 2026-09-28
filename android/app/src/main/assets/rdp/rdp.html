@@ -18,6 +18,9 @@
     width: 100%;
     height: 100%;
     overflow: hidden;
+    /* Its own compositing layer, so overlays appearing above it (the file
+       bars) do not make the WebView rebuild layers and flash. */
+    will-change: transform;
   }
   #status {
     position: fixed;
@@ -37,6 +40,134 @@
   #status[hidden] {
     display: none;
   }
+  /* Floating at the top, above the remote desktop canvas. */
+  #transfers {
+    position: fixed;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: min(440px, calc(100% - 24px));
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    /* Always a layer of its own (also while empty); see iron-remote-desktop. */
+    will-change: transform;
+  }
+  .transfer {
+    box-sizing: border-box;
+    padding: 10px 12px;
+    border-radius: 14px;
+    background: rgba(243, 243, 243, 0.95);
+    color: #222;
+    font-size: 13px;
+    box-shadow: 0 4px 18px rgba(0, 0, 0, 0.25);
+  }
+  .transfer[hidden] {
+    display: none;
+  }
+  .transfer header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 600;
+    margin-bottom: 6px;
+  }
+  .transfer header span {
+    flex: 1;
+  }
+  .transfer .row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+  }
+  .transfer .name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .transfer .state {
+    flex: 0 1 auto;
+    max-width: 45%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: #666;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .transfer header span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .transfer button {
+    flex: none;
+  }
+  .transfer button {
+    border: 0;
+    border-radius: 8px;
+    padding: 5px 10px;
+    background: #6750a4;
+    color: #fff;
+    font-size: 12px;
+  }
+  .transfer button.plain {
+    background: transparent;
+    color: #444;
+    font-size: 15px;
+    padding: 2px 6px;
+  }
+  .transfer .item + .item {
+    border-top: 1px solid rgba(0, 0, 0, 0.06);
+  }
+  .transfer .bar {
+    height: 4px;
+    margin: 2px 0 6px;
+    border-radius: 2px;
+    background: rgba(0, 0, 0, 0.1);
+    overflow: hidden;
+  }
+  .transfer .bar i {
+    display: block;
+    width: 0;
+    height: 100%;
+    background: #6750a4;
+    transition: width 0.2s;
+  }
+  .transfer .failed .state {
+    max-width: 65%;
+    color: #b3261e;
+    white-space: normal;
+  }
+  .transfer .failed .bar i {
+    background: #b3261e;
+  }
+  .transfer [hidden] {
+    display: none;
+  }
+  .transfer button.small {
+    font-size: 12px;
+  }
+  .transfer pre.log {
+    max-height: 40vh;
+    margin: 0 0 6px;
+    padding: 6px;
+    overflow: auto;
+    border-radius: 6px;
+    background: #fff;
+    color: #333;
+    font-size: 10px;
+    white-space: pre-wrap;
+    word-break: break-all;
+    user-select: text;
+    -webkit-user-select: text;
+  }
+  .transfer button:disabled {
+    opacity: 0.5;
+  }
   #status small {
     display: block;
     margin-top: 6px;
@@ -48,6 +179,10 @@
 </head>
 <body>
 <div id="status">Connecting…</div>
+<div id="transfers" data-your-workspace-ui>
+  <div id="downloads" class="transfer" hidden></div>
+  <div id="uploads" class="transfer" hidden></div>
+</div>
 <script>
   // Tells the app's page bridge to leave the viewport alone (see rdp zoom).
   window.__yourWorkspaceRdpPage = true;
@@ -74,6 +209,9 @@
       return {};
     }
   };
+  const gatewayNote = (text) => {
+    try { nativeBridge?.gatewayNote?.(sessionToken, text); } catch (_) {}
+  };
   const shortReason = (text) => String(text || '')
     .replace(/\[[^\]]*@ [^\]]*\]\s*/g, '')
     .slice(0, 160);
@@ -86,7 +224,27 @@
   // IronRDP synchronizes the clipboard through navigator.clipboard, which a
   // WebView cannot read. Back it with the Android clipboard instead.
   if (nativeBridge) {
-    const readText = async () => nativeBridge.clipboardText() || '';
+    // IronRDP polls the local clipboard; a change means it was replaced
+    // (copied on the phone, or text copied on the PC arrived).
+    let lastClipboardText = null;
+    const readText = async () => {
+      const read = nativeBridge.clipboardText();
+      // null: the clipboard cannot be read right now (the app is in the
+      // background); keep reporting the last content so nothing looks copied.
+      if (read === null || read === undefined) {
+        // Nothing known yet: fail the read (IronRDP skips it) rather than
+        // report an empty clipboard.
+        if (lastClipboardText === null) throw new Error('clipboard not readable yet');
+        return lastClipboardText;
+      }
+      const text = read;
+      if (lastClipboardText !== null && text !== lastClipboardText) {
+        console.info(`clipboard: phone clipboard changed (${text.length} chars)`);
+        window.dispatchEvent(new Event('yourworkspace-clipboard-replaced'));
+      }
+      lastClipboardText = text;
+      return text;
+    };
     const textType = (types) => types.find((type) => type.startsWith('text/plain'))
       || types.find((type) => type.startsWith('text/'));
     const writeText = async (text) => nativeBridge.setClipboardText(String(text ?? ''));
@@ -123,9 +281,10 @@
     nativeBridge ? nativeBridge.config(sessionToken) : (window.__rdpTestConfig || '{}')
   );
 
-  const { init, Backend, displayControl } = await import('./iron-remote-desktop-rdp.js');
+  const { init, Backend, displayControl, enableCredssp, RdpFileTransferProvider } =
+    await import('./iron-remote-desktop-rdp.js');
   await import('./iron-remote-desktop.js');
-  await init('WARN');
+  await init('INFO');
 
   // The page stays at scale 1, so CSS pixels map to the WebView at all
   // times. The app's zoom sets the desktop's pixel density instead (see
@@ -181,16 +340,55 @@
   let attempts = 0;
   let connectedSize = null;
   let checkTimer = 0;
+  // One resize at a time: changes while the server is still resizing only
+  // mark the area as changed, and the latest size follows once it is done.
+  let resizeInFlight = false;
+  let changedWhileInFlight = false;
+
+  let lastResizeAt = 0;
+  let pendingFitTimer = 0;
+  let catchUpAttempts = 0;
+  // Sizes asked for in the last seconds. Windows can apply an earlier request
+  // late (e.g. the size with the keyboard open after it closed again); such
+  // a frame is a stale answer, not the server's limit.
+  const recentRequests = [];
+  const sameSize = (a, b) => a && b && Math.abs(a.width - b.width) <= 2 && Math.abs(a.height - b.height) <= 2;
+  const isStaleAnswer = (applied, requested) => {
+    const now = Date.now();
+    while (recentRequests.length && now - recentRequests[0].at > 15000) recentRequests.shift();
+    return !sameSize(applied, requested) && recentRequests.some((entry) => sameSize(applied, entry.size));
+  };
+  const resizeDesktop = (size) => {
+    lastResizeAt = Date.now();
+    recentRequests.push({ size, at: lastResizeAt });
+    if (recentRequests.length > 8) recentRequests.shift();
+    ui.resize(size.width, size.height);
+    window.clearTimeout(pendingFitTimer);
+    pendingFitTimer = window.setTimeout(catchUp, 1500);
+  };
+  // A frame still not at the requested size a while after the last request
+  // (a dropped or overtaken resize): ask again, a few times.
+  function catchUp() {
+    fitDisplay();
+    const canvas = rendererCanvas();
+    if (!connected || resizeInFlight || !canvas || !connectedSize) return;
+    if (sameSize({ width: canvas.width, height: canvas.height }, connectedSize)) {
+      catchUpAttempts = 0;
+      return;
+    }
+    if (catchUpAttempts >= 5) return;
+    catchUpAttempts += 1;
+    requestSize(desktopSize());
+  }
 
   const rendererCanvas = () => element.shadowRoot?.querySelector('canvas') || null;
 
-  // The page scales the desktop itself: it fills the available area once the
-  // server applies a size, and keeps its scale (anchored top left) while a
-  // resize is pending instead of shrinking the old frame to fit.
+  // The page scales the desktop itself: the whole frame, as large as fits.
   const fitDisplay = () => {
     const canvas = rendererCanvas();
     if (!canvas || !canvas.width || !canvas.height) return;
     const available = availableSize();
+    // Always show the whole frame; a new size follows quickly instead.
     const scale = Math.max(canvas.width / available.width, canvas.height / available.height);
     element.style.setProperty('--rdp-width', `${canvas.width / scale}px`);
     element.style.setProperty('--rdp-height', `${canvas.height / scale}px`);
@@ -214,66 +412,111 @@
 
   const requestSize = (size) => {
     connectedSize = size;
+    resizeInFlight = true;
     try {
-      ui.resize(size.width, size.height);
+      resizeDesktop(size);
     } catch (_) {
+      resizeInFlight = false;
       fitDisplay();
       return;
     }
     checkAppliedSize(size);
   };
 
+  const resizeSettled = () => {
+    resizeInFlight = false;
+    if (changedWhileInFlight) {
+      changedWhileInFlight = false;
+      syncDesktopSize();
+    } else {
+      fitDisplay();
+    }
+  };
+
   // After the server applies a size, learn its limit when it shrank a
   // dimension, and ask again for a size with the right aspect ratio. When
   // the server does not follow, fit what it sends.
-  const checkAppliedSize = (requested, retries = 2, atConnect = false) => {
+  const checkAppliedSize = (requested, retries = 2, atConnect = false, resends = 3) => {
     window.clearTimeout(checkTimer);
     const started = Date.now();
     // At connect the canvas already has the server's choice.
     const initial = atConnect ? null : rendererCanvas();
     const before = initial ? { width: initial.width, height: initial.height } : null;
     const poll = () => {
-      if (!connected || connectedSize !== requested) return;
+      if (!connected) {
+        resizeInFlight = false;
+        return;
+      }
+      if (connectedSize !== requested) return;
       const canvas = rendererCanvas();
       const applied = canvas ? { width: canvas.width, height: canvas.height } : null;
       const matches = applied
         && Math.abs(applied.width - requested.width) <= 2
         && Math.abs(applied.height - requested.height) <= 2;
       if (matches) {
+        catchUpAttempts = 0;
         fitDisplay();
+        resizeSettled();
         return;
       }
-      if (Date.now() - started < 4000) {
-        checkTimer = window.setTimeout(poll, 250);
+      // The server answered with another size (e.g. capped): act on it now.
+      // Otherwise wait for it, up to 1.2 s.
+      const stale = applied && isStaleAnswer(applied, requested);
+      const responded = applied && !stale
+        && (!before || applied.width !== before.width || applied.height !== before.height);
+      if (!responded && Date.now() - started < 1200) {
+        checkTimer = window.setTimeout(poll, 50);
         return;
       }
       fitDisplay();
-      if (!applied || retries <= 0) return;
-      // A server that ignored the request tells nothing about its limit.
-      if (before && applied.width === before.width && applied.height === before.height) return;
+      if (!responded && resends > 0) {
+        // Windows drops a resize that arrives while it is still applying one:
+        // ask again (after 1.2 s) for the current size instead of staying at
+        // a stale one.
+        const size = desktopSize();
+        connectedSize = size;
+        try {
+          resizeDesktop(size);
+        } catch (_) {
+          resizeSettled();
+          return;
+        }
+        checkAppliedSize(size, retries, false, resends - 1);
+        return;
+      }
+      if (!applied || retries <= 0 || !responded) {
+        // A server that ignored the request tells nothing about its limit.
+        resizeSettled();
+        return;
+      }
       let learned = false;
-      if (applied.width < requested.width - 2 && applied.width < serverLimit.width) {
+      if (applied.width < requested.width - 16 && applied.width < serverLimit.width) {
         serverLimit.width = applied.width;
         learned = true;
       }
-      if (applied.height < requested.height - 2 && applied.height < serverLimit.height) {
+      if (applied.height < requested.height - 16 && applied.height < serverLimit.height) {
         serverLimit.height = applied.height;
         learned = true;
       }
-      if (!learned) return;
+      if (!learned) {
+        resizeSettled();
+        return;
+      }
       const size = desktopSize();
       if (Math.abs(size.width - applied.width) < 4 && Math.abs(size.height - applied.height) < 4) {
+        resizeSettled();
         return;
       }
       connectedSize = size;
       try {
-        ui.resize(size.width, size.height);
+        resizeDesktop(size);
       } catch (_) {
+        resizeSettled();
         return;
       }
       checkAppliedSize(size, retries - 1);
     };
-    checkTimer = window.setTimeout(poll, 250);
+    checkTimer = window.setTimeout(poll, 50);
   };
 
   const errorKindNames = [
@@ -295,8 +538,12 @@
   };
 
   const scheduleReconnect = (reason) => {
-    console.warn('rdp disconnected:', reason);
+    let gatewayState = '';
+    try { gatewayState = JSON.stringify(gatewayStatus()); } catch (_) {}
+    console.warn('rdp disconnected:', typeof reason === 'string' ? reason : JSON.stringify(reason), gatewayState);
     connected = false;
+    resizeInFlight = false;
+    changedWhileInFlight = false;
     attempts += 1;
     if (attempts > 5) {
       showStatus('Disconnected. Tap Reload to try again.', shortReason(reason));
@@ -305,9 +552,27 @@
     }
     const delay = Math.min(10000, 1000 * attempts);
     showStatus(`Reconnecting… (${attempts}/5)`, shortReason(reason));
+    // The gateway notes which side closed the connection a moment later.
+    const shownAttempt = attempts;
+    window.setTimeout(() => {
+      const relayEnd = gatewayStatus().relayEnd;
+      if (!relayEnd) return;
+      console.warn('gateway: connection ended:', relayEnd);
+      if (!connected && attempts === shownAttempt) {
+        showStatus(`Reconnecting… (${attempts}/5)`, `${shortReason(reason)} · ${relayEnd}`);
+      }
+    }, 400);
     notifyNative('reconnecting', reason);
     setTimeout(connect, delay);
   };
+
+  // NLA (CredSSP/NTLM) in IronRDP splits an e-mail user name into user and
+  // domain ("name" + "outlook.com"), which a PC signed in with a Microsoft
+  // account rejects. Such names get one retry without NLA, where Windows
+  // receives the full name in the logon information.
+  const username = config.username || '';
+  const emailUsername = username.includes('@') && !username.includes('\\') && !config.domain;
+  let withoutNla = false;
 
   async function connect() {
     if (!attempts) showStatus('Connecting…');
@@ -321,11 +586,30 @@
       .withDesktopSize(size)
       .withExtension(displayControl(true));
     if (config.domain) builder.withServerDomain(config.domain);
+    if (withoutNla) builder.withExtension(enableCredssp(false));
     let session;
     try {
       session = await ui.connect(builder.build());
     } catch (error) {
       const { kind, detail, status } = describeError(error);
+      const gateway = gatewayStatus();
+      const signInFailed = kind === 'WrongPassword' || kind === 'LogonFailure'
+        || (gateway.stage === 'relay' && kind === 'General');
+      if (emailUsername && !withoutNla && signInFailed) {
+        withoutNla = true;
+        showStatus('Signing in with the full e-mail user name…');
+        connect();
+        return;
+      }
+      if (withoutNla && kind === 'NegotiationFailure') {
+        withoutNla = false;
+        const message = 'This PC requires Network Level Authentication, which cannot send '
+          + 'an e-mail user name here. Use the PC\'s local account name instead '
+          + '(run whoami on the PC).';
+        showStatus('Windows sign-in failed.', message);
+        notifyNative('sign_in_failed', message);
+        return;
+      }
       if (kind === 'WrongPassword' || kind === 'LogonFailure' || kind === 'AccessDenied') {
         showStatus('Windows rejected the user name or password.');
         notifyNative('credentials_rejected', kind);
@@ -336,7 +620,6 @@
         notifyNative('login_required');
         return;
       }
-      const gateway = gatewayStatus();
       if (gateway.stage === 'relay' && kind === 'General') {
         // TLS to the PC worked but the connection ended during CredSSP/NLA:
         // almost always a rejected sign-in. Retrying could lock the account.
@@ -355,6 +638,7 @@
     checkAppliedSize(size, 2, true);
     showStatus('');
     notifyNative('connected');
+    reannouncePendingUpload();
     try {
       const termination = await session.run();
       scheduleReconnect(termination.reason());
@@ -365,27 +649,591 @@
 
   // Follow every change of the available area (rotation, keyboard, address
   // bar) and of the app's zoom with a dynamic resize instead of a reconnect.
-  let resizeTimer = 0;
+  // The first change is sent right away; see resizeInFlight for the rest.
+  function syncDesktopSize() {
+    if (!connected || !ui || !connectedSize) return;
+    const size = desktopSize();
+    if (Math.abs(size.width - connectedSize.width) < 8
+        && Math.abs(size.height - connectedSize.height) < 8) {
+      if (!resizeInFlight) fitDisplay();
+      return;
+    }
+    if (resizeInFlight) {
+      changedWhileInFlight = true;
+      return;
+    }
+    catchUpAttempts = 0;
+    requestSize(size);
+  }
+  let areaFrame = 0;
   const onAreaChanged = () => {
-    window.clearTimeout(resizeTimer);
-    resizeTimer = window.setTimeout(() => {
-      if (!connected || !ui || !connectedSize) return;
-      const size = desktopSize();
-      if (Math.abs(size.width - connectedSize.width) < 8
-          && Math.abs(size.height - connectedSize.height) < 8) {
-        fitDisplay();
-        return;
-      }
-      requestSize(size);
-    }, 150);
+    // Coalesce the events of one layout change (resize, visual viewport,
+    // resize observer) into a single check on the next frame.
+    if (areaFrame) return;
+    areaFrame = window.requestAnimationFrame(() => {
+      areaFrame = 0;
+      syncDesktopSize();
+    });
   };
   window.addEventListener('resize', onAreaChanged);
+  window.visualViewport?.addEventListener('resize', onAreaChanged);
+  new ResizeObserver(onAreaChanged).observe(document.documentElement);
   window.addEventListener('yourworkspace-rdp-zoom', onAreaChanged);
+
+  // Files copied on the remote PC: offered in a bar at the bottom, fetched over
+  // the RDP clipboard channel and saved by the app to the device's Downloads.
+  const downloadsElement = document.getElementById('downloads');
+  const fileTransfer = new RdpFileTransferProvider();
+  const fileRows = new Map();
+  const formatSize = (bytes) => {
+    if (!bytes) return '';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let value = bytes;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit += 1;
+    }
+    return `${value.toFixed(unit ? 1 : 0)} ${units[unit]}`;
+  };
+  const saveToDevice = async (name, blob) => {
+    const response = await fetch(
+      `/download?t=${encodeURIComponent(sessionToken)}&name=${encodeURIComponent(name)}`,
+      { method: 'POST', body: blob, headers: { 'Content-Type': 'application/octet-stream' } }
+    );
+    const text = await response.text();
+    if (!response.ok) throw new Error(text || `HTTP ${response.status}`);
+    return JSON.parse(text).savedAs;
+  };
+  const downloadFile = async (file, index, row) => {
+    row.button.disabled = true;
+    row.state.textContent = 'Downloading…';
+    try {
+      const { transferId, completion } = fileTransfer.downloadFile(file, index);
+      fileRows.set(transferId, row);
+      const blob = await completion;
+      row.state.textContent = 'Saving…';
+      const savedAs = await saveToDevice(file.name, blob);
+      // Short status in the row; the app's toast names the saved location.
+      row.state.textContent = 'Saved ✓';
+      row.state.title = savedAs;
+      row.button.textContent = 'Again';
+      row.button.disabled = false;
+      notifyNative('file_saved', savedAs);
+    } catch (error) {
+      row.state.textContent = 'Failed';
+      row.state.title = String(error?.message || error);
+      row.button.disabled = false;
+    }
+  };
+  const showFiles = (files) => {
+    // The bar always shows the latest files copied on the PC.
+    fileRows.clear();
+    downloadsElement.replaceChildren();
+    // A copied image can arrive as a file list IronRDP misreads: dozens of
+    // entries with unprintable names and sizes of billions of GB. Keep only
+    // entries that look like real files.
+    const plausible = (file) => Number.isFinite(file.size) && file.size >= 0
+      && file.size < 2 ** 42
+      && typeof file.name === 'string' && file.name.length > 0
+      && !/[\u0000-\u001f\ufffd]/.test(file.name);
+    const entries = files
+      .map((file, index) => ({ file, index }))
+      .filter(({ file }) => !file.isDirectory && plausible(file));
+    if (entries.length < files.filter((file) => !file.isDirectory).length) {
+      console.warn(`file transfer: ignored ${files.length - entries.length} unreadable file entries`);
+    }
+    if (!entries.length) {
+      downloadsElement.hidden = true;
+      return;
+    }
+    const header = document.createElement('header');
+    const title = document.createElement('span');
+    title.textContent = entries.length === 1
+      ? 'File copied on the remote PC'
+      : `${entries.length} files copied on the remote PC`;
+    const all = document.createElement('button');
+    all.textContent = 'Download all';
+    const close = document.createElement('button');
+    close.className = 'plain';
+    close.textContent = '✕';
+    close.addEventListener('click', () => { downloadsElement.hidden = true; });
+    header.append(title);
+    if (entries.length > 1) header.append(all);
+    header.append(close);
+    downloadsElement.append(header);
+    const rows = entries.slice(0, 20).map(({ file, index }) => {
+      const element = document.createElement('div');
+      element.className = 'row';
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = file.path ? `${file.path}\\${file.name}` : file.name;
+      const state = document.createElement('span');
+      state.className = 'state';
+      state.textContent = formatSize(file.size);
+      const button = document.createElement('button');
+      button.textContent = 'Download';
+      const row = { state, button };
+      button.addEventListener('click', () => downloadFile(file, index, row));
+      element.append(name, state, button);
+      downloadsElement.append(element);
+      return { file, index, row };
+    });
+    all.addEventListener('click', async () => {
+      all.disabled = true;
+      for (const { file, index, row } of rows) {
+        if (!row.button.disabled) await downloadFile(file, index, row);
+      }
+    });
+    downloadsElement.hidden = false;
+  };
+  fileTransfer.on('files-available', showFiles);
+  // Other clipboard content replaced the copied files: they are gone.
+  window.addEventListener('yourworkspace-clipboard-replaced', () => {
+    downloadsElement.hidden = true;
+  });
+  fileTransfer.on('download-progress', (progress) => {
+    const row = fileRows.get(progress.transferId);
+    if (row) row.state.textContent = `${Math.round(progress.percentage)}%`;
+  });
+  // Device files the app picked (⇪): read from the app's gateway, then put on
+  // the remote clipboard. Windows reads them when they are pasted (Ctrl+V);
+  // the bar shows both phases with progress bars.
+  const uploadsElement = document.getElementById('uploads');
+  // Buttons in the transfer bars must not take keyboard focus: IronRDP only
+  // forwards keys while its canvas is focused.
+  for (const bar of [downloadsElement, uploadsElement]) {
+    bar.addEventListener('pointerdown', (event) => {
+      if (event.target.closest('button')) event.preventDefault();
+    });
+    bar.addEventListener('click', () => {
+      if (document.activeElement?.closest?.('#downloads, #uploads')) rendererCanvas()?.focus();
+    });
+  }
+  let upload = null;
+  let uploadHideTimer = 0;
+  // Warnings the IronRDP clipboard code logs (e.g. the server does not allow
+  // file copy), shown when an upload fails or never starts.
+  let lastClipboardWarning = '';
+  // Logged once when the session starts: the PC does not take files.
+  let clipboardCapabilityWarning = '';
+  // Recent clipboard lines from IronRDP, shown by the upload bar's Log button.
+  const clipboardLog = [];
+  for (const level of ['log', 'info', 'debug', 'warn', 'error']) {
+    const original = console[level].bind(console);
+    console[level] = (...args) => {
+      const text = args.map(String).join(' ');
+      // The capability exchange is one huge line; keep its channel chunk sizes.
+      if (/ServerDemandActive|ClientConfirmActive/.test(text)) {
+        const channel = text.match(/VirtualChannel\(VirtualChannel \{[^}]*\}\)/);
+        const side = /ServerDemandActive/.test(text) ? 'server' : 'client';
+        clipboardLog.push(`${new Date().toISOString().slice(11, 19)} caps ${side}: ${channel ? channel[0] : 'no VirtualChannel'}`);
+      }
+      if (level === 'warn' || level === 'error'
+          || /cliprdr|clipboard|file|format ?list|FormatData|lock|upload|disconnect|terminat|panic/i.test(text)) {
+        clipboardLog.push(`${new Date().toISOString().slice(11, 19)} ${text
+          .replace(/%c/g, '').replace(/\s+/g, ' ').replace(/^\S+Z /, '').slice(0, 300)}`);
+        if (clipboardLog.length > 120) clipboardLog.shift();
+      }
+      if (level !== 'warn' && level !== 'error') {
+        original(...args);
+        return;
+      }
+      if (/not negotiated/i.test(text)) clipboardCapabilityWarning = text.slice(0, 400);
+      if (/FILECLIP|FileContents|FileGroupDescriptor|file copy|file list|format list|Cliprdr/i.test(text)) {
+        lastClipboardWarning = text.replace(/\s+/g, ' ')
+          .replace(/^\S+Z (ERROR|WARN) [\w:]+: /, '').slice(0, 400);
+      }
+      original(...args);
+    };
+  }
+  const hideUploadsLater = (delay) => {
+    window.clearTimeout(uploadHideTimer);
+    uploadHideTimer = window.setTimeout(() => { uploadsElement.hidden = true; }, delay);
+  };
+  const setRow = (row, text, fraction) => {
+    row.state.textContent = text;
+    row.state.title = text;
+    if (fraction != null) row.fill.style.width = `${Math.max(0, Math.min(1, fraction)) * 100}%`;
+  };
+  // IronRDP keeps an upload pending until Windows has read every file, and
+  // refuses new uploads meanwhile. A new pick replaces a pending one.
+  // IronRDP polls the phone clipboard and sends any change to the PC, which
+  // would replace uploaded files there. It suspends that only while the file
+  // list is being sent; hold it until Windows has read the files instead.
+  // A real copy on the phone meanwhile ends the hold (the page keeps reading
+  // the clipboard): the newest content wins, as with any copy.
+  const clipboardHold = { suppress: null, resume: null, held: false, timer: 0, poll: 0 };
+  const holdClipboard = () => {
+    if (!clipboardHold.suppress) return;
+    clipboardHold.suppress();
+    clipboardHold.held = true;
+    window.clearTimeout(clipboardHold.timer);
+    clipboardHold.timer = window.setTimeout(releaseClipboard, 10 * 60 * 1000);
+    window.clearInterval(clipboardHold.poll);
+    clipboardHold.poll = window.setInterval(() => {
+      if (document.hasFocus()) navigator.clipboard.readText().catch(() => {});
+    }, 300);
+    console.info('clipboard: sync from the phone paused until the files are pasted');
+  };
+  const releaseClipboard = () => {
+    window.clearTimeout(clipboardHold.timer);
+    window.clearInterval(clipboardHold.poll);
+    if (!clipboardHold.held) return;
+    clipboardHold.held = false;
+    clipboardHold.resume?.();
+    console.info('clipboard: sync from the phone resumed');
+  };
+  const abandonPendingUpload = () => {
+    const state = fileTransfer.uploadState;
+    if (state === undefined) return;
+    for (const timer of state.readerTimeouts?.values?.() || []) clearTimeout(timer);
+    for (const reader of state.activeReaders?.values?.() || []) {
+      try { reader.abort(); } catch (error) { /* already done */ }
+    }
+    fileTransfer.uploadState = undefined;
+    fileTransfer.retainedFiles = undefined;
+    try { state.resolve?.(); } catch (error) { /* ignore */ }
+    releaseClipboard();
+  };
+  const updateUploadTitle = () => {
+    if (!upload) return;
+    const { rows } = upload;
+    const done = rows.filter((row) => row.done).length;
+    const failed = rows.filter((row) => row.failed).length;
+    if (upload.phase === 'reading') {
+      const total = rows.reduce((sum, row) => sum + (row.size || 0), 0);
+      const read = rows.reduce((sum, row) => sum + (row.read || 0), 0);
+      upload.title.textContent = total
+        ? `Reading from phone… ${Math.round((read / total) * 100)}%`
+        : 'Reading from phone…';
+      return;
+    }
+    if (done + failed < rows.length) {
+      const total = rows.reduce((sum, row) => sum + (row.size || 0), 0);
+      const sent = rows.reduce((sum, row) => sum + (row.sent || 0), 0);
+      upload.title.textContent = sent
+        ? `Uploading to the PC… ${total ? Math.round((sent / total) * 100) : 0}%`
+        : (rows.length === 1
+          ? 'Ready: paste it in a Windows folder (Ctrl+V)'
+          : `${rows.length} files ready: paste them in a Windows folder (Ctrl+V)`);
+      return;
+    }
+    upload.paste.hidden = true;
+    releaseClipboard();
+    if (failed) {
+      upload.title.textContent = failed === rows.length
+        ? 'Upload failed'
+        : `Uploaded ${done} of ${rows.length}, ${failed} failed`;
+      return;
+    }
+    upload.title.textContent = rows.length === 1 ? 'Upload complete ✓' : `${rows.length} files uploaded ✓`;
+    hideUploadsLater(3000);
+  };
+  const failRow = (row, message) => {
+    row.failed = true;
+    row.done = false;
+    row.element.classList.add('failed');
+    setRow(row, `Failed: ${message}`, null);
+    row.state.title = message;
+  };
+  window.__rdpUploadFromApp = async (items) => {
+    gatewayNote(`app: upload of ${items.length} file(s) started`);
+    window.clearTimeout(uploadHideTimer);
+    abandonPendingUpload();
+    lastClipboardWarning = '';
+    uploadsElement.replaceChildren();
+    const header = document.createElement('header');
+    const title = document.createElement('span');
+    const paste = document.createElement('button');
+    paste.textContent = 'Paste';
+    paste.title = 'Send Ctrl+V to Windows';
+    paste.hidden = true;
+    paste.addEventListener('click', () => {
+      gatewayNote('app: Paste pressed (Ctrl+V sent)');
+      ui?.ctrlV?.();
+    });
+    const close = document.createElement('button');
+    close.className = 'plain';
+    close.textContent = '✕';
+    close.addEventListener('click', () => {
+      window.clearTimeout(uploadHideTimer);
+      uploadsElement.hidden = true;
+      releaseClipboard();
+    });
+    const logButton = document.createElement('button');
+    logButton.className = 'plain small';
+    logButton.textContent = 'Log';
+    const logView = document.createElement('pre');
+    logView.className = 'log';
+    logView.hidden = true;
+    logButton.addEventListener('click', () => {
+      logView.hidden = !logView.hidden;
+      const channel = gatewayStatus().clipboard;
+      logView.textContent = (clipboardLog.join('\n') || '(no clipboard messages)')
+        + (channel ? `\n--- clipboard channel (gateway) ---\n${channel}` : '');
+      window.clearTimeout(uploadHideTimer);
+    });
+    // Shown when the PC stops answering: reconnecting restarts the PC's
+    // clipboard session and the files are announced again afterwards.
+    const retry = document.createElement('button');
+    retry.textContent = 'Retry';
+    retry.title = 'Reconnect and put the files on the PC clipboard again';
+    retry.hidden = true;
+    retry.addEventListener('click', () => {
+      retry.hidden = true;
+      gatewayNote('app: Retry pressed (reconnecting)');
+      title.textContent = 'Reconnecting to restart the PC clipboard…';
+      try { ui?.shutdown?.(); } catch (_) {}
+    });
+    header.append(title, retry, paste, logButton, close);
+    uploadsElement.append(header, logView);
+    const rows = items.map((item) => {
+      const element = document.createElement('div');
+      element.className = 'item';
+      const line = document.createElement('div');
+      line.className = 'row';
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = item.name;
+      const state = document.createElement('span');
+      state.className = 'state';
+      line.append(name, state);
+      const bar = document.createElement('div');
+      bar.className = 'bar';
+      const fill = document.createElement('i');
+      bar.append(fill);
+      element.append(line, bar);
+      uploadsElement.append(element);
+      const row = { element, state, fill, size: item.size > 0 ? item.size : 0, read: 0, sent: 0 };
+      setRow(row, formatSize(item.size) || 'Waiting', 0);
+      return row;
+    });
+    upload = { rows, title, paste, retry, phase: 'reading', byTransferId: new Map(), byFile: new Map() };
+    const current = upload;
+    uploadsElement.hidden = false;
+    updateUploadTitle();
+
+    const files = [];
+    const pickedRows = [];
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index];
+      const row = rows[index];
+      try {
+        const response = await fetch(
+          `/upload?t=${encodeURIComponent(sessionToken)}&id=${encodeURIComponent(item.id)}`
+        );
+        if (!response.ok) {
+          throw new Error(response.status === 404 ? 'expired, pick the file again' : `HTTP ${response.status}`);
+        }
+        const length = Number(response.headers.get('Content-Length')) || row.size;
+        row.size = length;
+        const chunks = [];
+        const reader = response.body.getReader();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          row.read += value.length;
+          setRow(row, length ? `Reading ${Math.round((row.read / length) * 100)}%` : `Reading ${formatSize(row.read)}`,
+            length ? (row.read / length) * 0.3 : null);
+          if (current === upload) updateUploadTitle();
+        }
+        if (length && row.read < length) throw new Error('the file could not be read completely');
+        row.size = row.read;
+        const file = new File(chunks, item.name, { lastModified: Date.now() });
+        files.push(file);
+        pickedRows.push(row);
+        current.byFile.set(file, row);
+        setRow(row, `${formatSize(file.size) || '0 B'} · waiting for paste`, 0.3);
+      } catch (error) {
+        failRow(row, String(error?.message || error).slice(0, 80));
+      }
+    }
+    if (current !== upload) return;
+    current.phase = 'clipboard';
+    if (!files.length) {
+      updateUploadTitle();
+      return;
+    }
+    current.files = files;
+    current.pickedRows = pickedRows;
+    try {
+      const { transferIds, completion } = fileTransfer.uploadFiles(files);
+      holdClipboard();
+      for (const [fileIndex, transferId] of transferIds || []) {
+        current.byTransferId.set(transferId, pickedRows[fileIndex]);
+      }
+      completion?.catch((error) => {
+        if (current !== upload) return;
+        for (const row of pickedRows) {
+          if (!row.done && !row.failed) failRow(row, String(error?.message || error).slice(0, 80));
+        }
+        updateUploadTitle();
+      });
+    } catch (error) {
+      clipboardHold.resume?.();
+      const reason = lastClipboardWarning || String(error?.message || error);
+      for (const row of pickedRows) failRow(row, reason.slice(0, 120));
+      current.title.textContent = 'Could not put the files on the remote clipboard';
+      return;
+    }
+    // IronRDP only logs a refused file list (the call itself succeeds).
+    if (!lastClipboardWarning && /FILECLIP_ENABLED not negotiated/i.test(clipboardCapabilityWarning)) {
+      lastClipboardWarning = clipboardCapabilityWarning;
+    }
+    const refused = () => /Initiate file copy failed|FILECLIP_ENABLED not negotiated|rejected our format list/i.test(lastClipboardWarning);
+    const failRefused = () => {
+      abandonPendingUpload();
+      const reason = /not in Ready state/i.test(lastClipboardWarning)
+        ? 'the PC\'s clipboard is not available (clipboard redirection off, or still starting)'
+        : /not negotiated/i.test(lastClipboardWarning)
+          ? 'the PC does not allow file copy over the clipboard'
+          : /rejected our format list/i.test(lastClipboardWarning)
+            ? 'the PC rejected the file list'
+          : lastClipboardWarning;
+      for (const row of pickedRows) failRow(row, reason);
+      current.paste.hidden = true;
+      current.title.textContent = 'Upload failed: try again';
+      current.title.title = lastClipboardWarning;
+    };
+    if (refused()) {
+      failRefused();
+      return;
+    }
+    current.paste.hidden = false;
+    updateUploadTitle();
+    for (const delay of [500, 2000, 5000]) {
+      window.setTimeout(() => {
+        if (current === upload && refused() && !pickedRows.some((row) => row.sent)) failRefused();
+      }, delay);
+    }
+    // Windows' clipboard process (rdpclip) sometimes stops answering: say so
+    // instead of showing Ready for files the PC cannot paste yet.
+    let stalled = false;
+    const watchStall = () => {
+      if (current !== upload || upload.phase !== 'clipboard' || pickedRows.some((row) => row.sent)) return;
+      const waiting = Number(gatewayStatus().fileListWaitMs) || 0;
+      if (waiting > 7000 && !stalled) {
+        stalled = true;
+        gatewayNote(`app: PC has not answered the file list for ${Math.round(waiting / 1000)} s`);
+        current.title.textContent = 'Windows clipboard is not responding: tap Retry';
+        current.retry.hidden = false;
+        current.paste.hidden = true;
+      } else if (!waiting && stalled) {
+        stalled = false;
+        current.retry.hidden = true;
+        current.paste.hidden = false;
+        updateUploadTitle();
+      }
+      window.setTimeout(watchStall, 2000);
+    };
+    window.setTimeout(watchStall, 2000);
+  };
+  // A reconnect starts a new clipboard session on the PC without the files:
+  // announce the ones still waiting for paste again once it is ready.
+  let reannounceToken = 0;
+  const reannouncePendingUpload = async () => {
+    const pending = upload;
+    if (!pending || pending.phase !== 'clipboard' || !pending.files?.length) return;
+    if (pending.rows.some((row) => row.sent || row.done)) return;
+    const token = ++reannounceToken;
+    pending.title.textContent = 'Reconnected: putting the files back on the PC clipboard…';
+    const started = Date.now();
+    while (!gatewayStatus().clipboardReady) {
+      if (Date.now() - started > 90000) {
+        pending.title.textContent = 'Reconnected, but the PC clipboard is not ready: upload again';
+        return;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+      if (token !== reannounceToken || upload !== pending || !connected) return;
+    }
+    abandonPendingUpload();
+    try {
+      const { transferIds } = fileTransfer.uploadFiles(pending.files);
+      holdClipboard();
+      pending.byTransferId.clear();
+      for (const [fileIndex, transferId] of transferIds || []) {
+        pending.byTransferId.set(transferId, pending.pickedRows[fileIndex]);
+      }
+      gatewayNote('app: files announced again after reconnect');
+      updateUploadTitle();
+    } catch (error) {
+      for (const row of pending.pickedRows) failRow(row, String(error?.message || error).slice(0, 80));
+      pending.title.textContent = 'Could not put the files back after reconnecting: upload again';
+    }
+  };
+  // The clipboard changed (copied on the phone, or on the PC) before Windows
+  // read the files: the PC's clipboard no longer holds them.
+  window.addEventListener('yourworkspace-clipboard-replaced', () => {
+    if (!upload || upload.phase !== 'clipboard') return;
+    const waiting = upload.rows.filter((row) => !row.done && !row.failed && !row.sent);
+    if (!waiting.length) return;
+    for (const row of waiting) failRow(row, 'replaced by a newer copy; upload again to paste it');
+    upload.paste.hidden = true;
+    upload.title.textContent = 'Replaced by what you copied';
+    abandonPendingUpload();
+  });
+  fileTransfer.on('upload-progress', (progress) => {
+    const row = upload?.byTransferId.get(progress.transferId);
+    if (!row) return;
+    // A re-paste starts over.
+    if (row.done && progress.bytesTransferred < progress.totalBytes) row.done = false;
+    row.sent = progress.bytesTransferred;
+    setRow(row, `Uploading ${Math.round(progress.percentage)}%`, 0.3 + (progress.percentage / 100) * 0.7);
+    if (uploadsElement.hidden) {
+      window.clearTimeout(uploadHideTimer);
+      uploadsElement.hidden = false;
+    }
+    updateUploadTitle();
+  });
+  fileTransfer.on('upload-complete', (file) => {
+    const row = upload?.byFile.get(file);
+    if (!row) return;
+    row.done = true;
+    row.sent = row.size;
+    setRow(row, 'Done ✓', 1);
+    updateUploadTitle();
+  });
+  fileTransfer.on('error', (error) => {
+    console.warn('file transfer:', error.message);
+    if (error.transferId == null) return;
+    const uploadRow = upload?.byTransferId.get(error.transferId);
+    if (uploadRow) {
+      failRow(uploadRow, String(error.message).slice(0, 80));
+      updateUploadTitle();
+      return;
+    }
+    const downloadRow = fileRows.get(error.transferId);
+    if (downloadRow) downloadRow.state.textContent = 'Failed';
+  });
 
   element.addEventListener('ready', (event) => {
     ui = event.detail.irgUserInteraction;
     ui.setEnableClipboard(true);
     ui.setEnableAutoClipboard(true);
+    ui.enableFileTransfer(fileTransfer);
+    // enableFileTransfer wires these to pause/resume clipboard monitoring
+    // around sending the file list; the page holds the pause itself.
+    // Log what Windows asks for, to show in the upload bar's Log.
+    const serveRequest = fileTransfer.handleFileContentsRequest?.bind(fileTransfer);
+    if (serveRequest) {
+      let logged = 0;
+      fileTransfer.handleFileContentsRequest = (request) => {
+        if (logged < 20) {
+          logged += 1;
+          console.info(`upload: PC requests file ${request.index} flags=${request.flags} `
+            + `position=${request.position} size=${request.size}`);
+        }
+        return serveRequest(request);
+      };
+    }
+    clipboardHold.suppress = fileTransfer.onUploadStarted;
+    clipboardHold.resume = fileTransfer.onUploadFinished;
+    fileTransfer.onUploadFinished = () => {};
+    // Characters without a physical key (Chinese, ...) are sent as Unicode;
+    // the app's keyboard bridge switches this on for just those characters.
+    window.__rdpKeyboardUnicodeMode = (enabled) => ui.setKeyboardUnicodeMode(Boolean(enabled));
     // The component sets up its clipboard handlers right after this event;
     // connecting synchronously would build the session without them.
     window.setTimeout(connect, 100);

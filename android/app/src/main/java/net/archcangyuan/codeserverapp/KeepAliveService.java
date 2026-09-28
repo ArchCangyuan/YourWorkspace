@@ -27,6 +27,9 @@ public final class KeepAliveService extends Service {
     private static final int NOTIFICATION_ID = 1001;
     private static final int RESTART_REQUEST_CODE = 1002;
 
+    /** Set by the app while a built-in remote desktop session is open. */
+    static volatile boolean remoteDesktopActive;
+
     private PowerManager.WakeLock wakeLock;
     private WindowManager windowManager;
     private View processAnchor;
@@ -40,7 +43,8 @@ public final class KeepAliveService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (!isEnabled(this)) {
+        boolean keepAlive = isEnabled(this);
+        if (!keepAlive && !remoteDesktopActive) {
             stopSelf();
             return START_NOT_STICKY;
         }
@@ -57,8 +61,12 @@ public final class KeepAliveService extends Service {
 
         Notification notification = new Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentTitle("YourWorkspace is keeping sessions alive")
-            .setContentText("Tap to return to your remote workspace")
+            .setContentTitle(keepAlive
+                ? "YourWorkspace is keeping sessions alive"
+                : "Remote desktop connected")
+            .setContentText(keepAlive
+                ? "Tap to return to your remote workspace"
+                : "Keeps the remote desktop connected in the background")
             .setContentIntent(contentIntent)
             .setOngoing(true)
             .setCategory(Notification.CATEGORY_SERVICE)

@@ -20,6 +20,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.IBinder;
 import android.os.Looper;
 import android.os.Message;
 import android.os.PowerManager;
@@ -50,13 +51,16 @@ import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.SeekBar;
+import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -80,8 +84,16 @@ public final class MainActivity extends Activity {
     private static final String PROJECTS_KEY = "saved_projects";
     private static final String KEEP_ALIVE_KEY = "keep_alive_enabled";
     private static final String MOUSE_MODE_KEY = "mouse_mode_enabled";
+    private static final String FULLSCREEN_KEY = "fullscreen_enabled";
+    private static final String KEYBOARD_LOCK_KEY = "keyboard_lock";
+    private static final int KEYBOARD_UNLOCKED = 0;
+    private static final int KEYBOARD_LOCKED_OPEN = 1;
+    private static final int KEYBOARD_LOCKED_HIDDEN = 2;
+    private static final long KEYBOARD_RESHOW_DELAY_MS = 120L;
+    private static final long KEYBOARD_HOLD_TIMEOUT_MS = 1_500L;
     private static final int NOTIFICATION_PERMISSION_REQUEST = 2001;
     private static final int OVERLAY_PERMISSION_REQUEST = 2002;
+    private static final int UPLOAD_FILES_REQUEST = 2003;
     private static final long SESSION_KEEP_ALIVE_PULSE_MS = 10_000L;
     private static final String LEGACY_NATIVE_ZOOM_PERCENT_KEY = "zoom_percent";
     private static final String LAYOUT_ZOOM_STEPS_KEY = "layout_zoom_steps";
@@ -98,6 +110,8 @@ public final class MainActivity extends Activity {
     private static final int KEY_BACKGROUND = Color.rgb(230, 230, 234);
     /** Height of the key bar's keys; the bar adds 3 dp above and below. */
     private static final int KEY_HEIGHT_DP = 32;
+    /** Height of the address bar, without the top cutout inset. */
+    private static final int ADDRESS_BAR_HEIGHT_DP = 44;
     private static final String DESKTOP_USER_AGENT =
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
             + "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -234,7 +248,7 @@ public final class MainActivity extends Activity {
           window.__codeServerAppIsRdpPage = () => Boolean(findIronRdpCanvas());
 
           const existingBridge = window.__codeServerAppKeyboard;
-          if (existingBridge && existingBridge.version >= 12) {
+          if (existingBridge && existingBridge.version >= 17) {
             window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
             existingBridge.installRdpGestures?.();
             existingBridge.installDesktopGestures?.();
@@ -338,7 +352,45 @@ public final class MainActivity extends Activity {
               event.stopImmediatePropagation();
             }, true);
 
+            // Two-finger swipes scroll like a mouse wheel at the fingers' midpoint.
+            // Pixel deltas, doubled so a swipe covers a comfortable distance.
+            const WHEEL_GAIN = 2;
+            let wheel = null;
+            const midpoint = (touches) => {
+              const first = pointFromTouch(touches[0]);
+              const second = pointFromTouch(touches[1]);
+              return {
+                clientX: (first.clientX + second.clientX) / 2,
+                clientY: (first.clientY + second.clientY) / 2,
+                screenX: (first.screenX + second.screenX) / 2,
+                screenY: (first.screenY + second.screenY) / 2
+              };
+            };
+            const dispatchWheel = (point, deltaX, deltaY) => {
+              const eventWindow = canvas.ownerDocument?.defaultView || window;
+              canvas.dispatchEvent(new eventWindow.WheelEvent('wheel', {
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+                view: eventWindow,
+                clientX: point.clientX,
+                clientY: point.clientY,
+                screenX: point.screenX,
+                screenY: point.screenY,
+                deltaX,
+                deltaY,
+                deltaMode: 0
+              }));
+            };
+
             canvas.addEventListener('touchstart', (event) => {
+              if (event.touches.length === 2 && !gesture?.dragging) {
+                releaseGesture();
+                gesture = null;
+                wheel = { last: midpoint(event.touches) };
+                dispatchMouse(canvas, 'mousemove', wheel.last, 0, 0);
+                return;
+              }
               if (event.touches.length !== 1) return;
               const start = pointFromTouch(event.touches[0]);
               gesture = {
@@ -354,6 +406,22 @@ public final class MainActivity extends Activity {
             }, { capture: true, passive: true });
 
             canvas.addEventListener('touchmove', (event) => {
+              if (wheel && event.touches.length === 2) {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+                const point = midpoint(event.touches);
+                const dx = point.clientX - wheel.last.clientX;
+                const dy = point.clientY - wheel.last.clientY;
+                if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) return;
+                wheel.last = point;
+                // IronRDP scrolls one axis per event: send the dominant one.
+                if (Math.abs(dy) >= Math.abs(dx)) {
+                  dispatchWheel(point, 0, -dy * WHEEL_GAIN);
+                } else {
+                  dispatchWheel(point, -dx * WHEEL_GAIN, 0);
+                }
+                return;
+              }
               if (!gesture || event.touches.length !== 1) return;
               const point = pointFromTouch(event.touches[0]);
               gesture.last = point;
@@ -383,6 +451,7 @@ public final class MainActivity extends Activity {
             }, { capture: true, passive: false });
 
             const finishGesture = (event, cancelled) => {
+              if (wheel && event.touches.length < 2) wheel = null;
               if (!gesture) return;
               releaseGesture();
               const touch = event.changedTouches?.[0];
@@ -458,7 +527,24 @@ public final class MainActivity extends Activity {
               event.stopImmediatePropagation();
             }, true);
 
+            // Two-finger swipes scroll like a mouse wheel (pages and Monaco alike),
+            // following the midpoint of the fingers. They replace pinch zoom; the
+            // app's zoom slider sets the page zoom.
+            let wheel = null;
+            const touchMidpoint = (touches) => ({
+              clientX: (touches[0].clientX + touches[1].clientX) / 2,
+              clientY: (touches[0].clientY + touches[1].clientY) / 2
+            });
+
             document.addEventListener('touchstart', (event) => {
+              if (event.touches.length === 2
+                  && !isIronRdpEvent(event)
+                  && !gesture?.dragging) {
+                clearTimer(gesture);
+                gesture = null;
+                wheel = { last: touchMidpoint(event.touches) };
+                return;
+              }
               if (event.touches.length !== 1 || isIronRdpEvent(event)) return;
               const path = eventPath(event);
               const startTarget = path.find((target) => target?.dispatchEvent)
@@ -480,6 +566,17 @@ public final class MainActivity extends Activity {
             }, { capture: true, passive: true });
 
             document.addEventListener('touchmove', (event) => {
+              if (wheel && event.touches.length === 2) {
+                if (event.cancelable) event.preventDefault();
+                event.stopImmediatePropagation();
+                const point = touchMidpoint(event.touches);
+                const dx = wheel.last.clientX - point.clientX;
+                const dy = wheel.last.clientY - point.clientY;
+                if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) return;
+                wheel.last = point;
+                mouseWheel(point.clientX, point.clientY, dx, dy);
+                return;
+              }
               if (!gesture || event.touches.length !== 1) return;
               const point = pointFromTouch(event.touches[0]);
               gesture.last = point;
@@ -509,6 +606,7 @@ public final class MainActivity extends Activity {
             }, { capture: true, passive: false });
 
             const finishGesture = (event, cancelled) => {
+              if (wheel && event.touches.length < 2) wheel = null;
               if (!gesture) return;
               const activeGesture = gesture;
               gesture = null;
@@ -610,9 +708,28 @@ public final class MainActivity extends Activity {
             if (!isGeneric || !state.target) state.target = candidate;
           };
 
+          // IronRDP only takes keys while its canvas has focus; a tap elsewhere
+          // (e.g. a file bar button) moves it away, so restore it before typing.
+          const focusedIronRdpCanvas = (canvas) => {
+            const host = canvas.getRootNode?.()?.host;
+            if (host && document.activeElement !== host) {
+              canvas.focus({ preventScroll: true });
+            }
+            return canvas;
+          };
+
           const activeTarget = () => {
             if (state.ironRdpCanvas && state.ironRdpCanvas.isConnected) {
-              return state.ironRdpCanvas;
+              return focusedIronRdpCanvas(state.ironRdpCanvas);
+            }
+            // On the built-in remote desktop page all typing belongs to the
+            // remote desktop, even before KB was pressed.
+            if (window.__yourWorkspaceRdpPage) {
+              const canvas = findIronRdpCanvas();
+              if (canvas) {
+                state.ironRdpCanvas = canvas;
+                return focusedIronRdpCanvas(canvas);
+              }
             }
             const current = deepestActiveElement(document);
             if (current && !isProxy(current)) {
@@ -797,7 +914,16 @@ public final class MainActivity extends Activity {
           const forwardText = (text) => {
             for (const key of Array.from(text || '')) {
               const info = keyInfoForText(key);
-              dispatchCompleteKey(key, info.code, info.keyCode, info.shift);
+              // IronRDP sends scancodes and drops characters without a physical
+              // key (Chinese, Japanese, ...). The built-in remote desktop page
+              // lets its Unicode mode be switched on for just those characters.
+              const unicodeMode = !info.code ? window.__rdpKeyboardUnicodeMode : null;
+              if (typeof unicodeMode === 'function') unicodeMode(true);
+              try {
+                dispatchCompleteKey(key, info.code, info.keyCode, info.shift);
+              } finally {
+                if (typeof unicodeMode === 'function') unicodeMode(false);
+              }
             }
           };
 
@@ -984,17 +1110,19 @@ public final class MainActivity extends Activity {
             cursor: null,
             left: null,
             right: null,
-            lockButton: null,
             touches: new Map(),
             cursorX: -1,
             cursorY: -1,
-            leftHeld: false,
-            leftLocked: false,
-            leftLockArmed: false,
-            leftMoved: false,
-            leftUnlockPending: false,
-            lockTimer: 0,
-            rightHeld: false,
+            // Per mouse button (0 left, 2 right): held down, locked down after
+            // a 1 s press, armed (lock reached, finger still on the button),
+            // released by the next tap (unlockPending), moved while held.
+            buttons: {
+              0: { held: false, locked: false, armed: false, unlockPending: false, moved: false, timer: 0 },
+              2: { held: false, locked: false, armed: false, unlockPending: false, moved: false, timer: 0 }
+            },
+            // Set by the app's keyboard lock ("locked hidden"): like mouse mode,
+            // editable elements get inputmode=none so the keyboard never opens.
+            keyboardLocked: false,
             inputModes: new Map()
           };
 
@@ -1162,8 +1290,10 @@ public final class MainActivity extends Activity {
 
           // inputmode="none" keeps the system keyboard hidden while the element
           // still takes focus and receives forwarded keys.
+          const keyboardBlocked = () => mouseMode.enabled || mouseMode.keyboardLocked;
+
           const suppressKeyboardFor = (element) => {
-            if (!mouseMode.enabled || !isEditableElement(element)) return;
+            if (!keyboardBlocked() || !isEditableElement(element)) return;
             if (!mouseMode.inputModes.has(element)) {
               mouseMode.inputModes.set(element, element.getAttribute('inputmode'));
             }
@@ -1173,7 +1303,7 @@ public final class MainActivity extends Activity {
           };
 
           const suppressKeyboardInDocument = () => {
-            if (!mouseMode.enabled) return;
+            if (!keyboardBlocked()) return;
             for (const element of document.querySelectorAll(
               'textarea, input, [contenteditable]'
             )) {
@@ -1361,27 +1491,37 @@ public final class MainActivity extends Activity {
               .button {
                 position: absolute; box-sizing: border-box; border-radius: 50%;
                 display: flex; align-items: center; justify-content: center;
-                font-family: system-ui, sans-serif; font-weight: 700; color: #fff;
-                background: rgba(0, 0, 0, 0.31); border: 2px solid rgba(255, 255, 255, 0.6);
-                pointer-events: auto; touch-action: none;
+                font-family: system-ui, sans-serif; font-weight: 600; color: #fff;
+                background: rgba(20, 20, 24, 0.42);
+                box-shadow: 0 1px 6px rgba(0, 0, 0, 0.35);
+                pointer-events: none; touch-action: none;
                 user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+                transition: background-color 120ms;
               }
-              .button.pressed { background: rgba(103, 80, 164, 0.67); }
-              .button.locked { background: rgba(103, 80, 164, 0.86); border-color: #fff; }
-              .button.lock { font-weight: 400; }
+              .button.pressed { background: rgba(103, 80, 164, 0.62); }
+              .button.locked { background: rgba(103, 80, 164, 0.88); }
+              /* The outline doubles as the hold-to-lock progress ring. */
+              .ring { position: absolute; inset: 0; width: 100%; height: 100%;
+                transform: rotate(-90deg); overflow: visible; }
+              .ring circle { fill: none; stroke-width: 2.4; }
+              .ring .track { stroke: rgba(255, 255, 255, 0.55); }
+              .ring .bar { stroke: #d0bcff; stroke-linecap: round;
+                stroke-dasharray: 100.53; stroke-dashoffset: 100.53; }
+              .button.charging .ring .bar { stroke-dashoffset: 0;
+                transition: stroke-dashoffset 1000ms linear; }
+              .button.locked .ring .bar { stroke: #fff; stroke-dashoffset: 0; }
+              .label { position: relative; line-height: 1; }
             </style>
             <svg class="cursor" viewBox="0 0 14 22">
               <path d="M0.7 0.7 L0.7 18.5 L5.2 14.3 L8.3 21 L11.3 19.7 L8.2 13.1 L13.7 13.1 Z"
                 fill="#fff" stroke="#000" stroke-width="1.4" stroke-linejoin="round"/>
             </svg>
-            <div class="button left">L</div>
-            <div class="button right">R</div>
-            <div class="button lock" title="Hold the left button">🔓</div>`;
+            <div class="button left"><svg class="ring" viewBox="0 0 36 36"><circle class="track" cx="18" cy="18" r="16"/><circle class="bar" cx="18" cy="18" r="16"/></svg><span class="label">L</span></div>
+            <div class="button right"><svg class="ring" viewBox="0 0 36 36"><circle class="track" cx="18" cy="18" r="16"/><circle class="bar" cx="18" cy="18" r="16"/></svg><span class="label">R</span></div>`;
             mouseMode.host = host;
             mouseMode.cursor = root.querySelector('.cursor');
             mouseMode.left = root.querySelector('.left');
             mouseMode.right = root.querySelector('.right');
-            mouseMode.lockButton = root.querySelector('.lock');
             document.documentElement.appendChild(host);
           };
 
@@ -1395,16 +1535,12 @@ public final class MainActivity extends Activity {
 
           const updateMouseButtons = () => {
             if (!mouseMode.left) return;
-            const leftLocked = mouseMode.leftLocked || mouseMode.leftLockArmed;
-            mouseMode.left.classList.toggle(
-              'pressed',
-              mouseMode.leftHeld || mouseMode.leftUnlockPending
-            );
-            mouseMode.left.classList.toggle('locked', leftLocked);
-            mouseMode.left.textContent = leftLocked ? 'L🔒' : 'L';
-            mouseMode.right.classList.toggle('pressed', mouseMode.rightHeld);
-            mouseMode.lockButton.classList.toggle('locked', mouseMode.leftLocked);
-            mouseMode.lockButton.textContent = mouseMode.leftLocked ? '🔒' : '🔓';
+            for (const [button, element] of [[0, mouseMode.left], [2, mouseMode.right]]) {
+              const state = mouseMode.buttons[button];
+              element.classList.toggle('pressed', state.held || state.unlockPending);
+              element.classList.toggle('locked', state.locked || state.armed);
+              element.classList.toggle('charging', Boolean(state.timer));
+            }
           };
 
           const layoutMouseOverlay = () => {
@@ -1429,10 +1565,9 @@ public final class MainActivity extends Activity {
               fontSize: `${18 * scale}px`,
               borderWidth: `${2 * scale}px`
             });
-            place(mouseMode.left, 68, 84, 40);
-            place(mouseMode.right, 56, 16, 16);
-            place(mouseMode.lockButton, 42, 97, 120);
-            mouseMode.lockButton.style.fontSize = `${16 * scale}px`;
+            // Side by side like a mouse, L on the left, near the right edge.
+            place(mouseMode.left, 60, 88, 28);
+            place(mouseMode.right, 60, 18, 28);
             if (mouseMode.cursorX < 0) {
               mouseMode.cursorX = rect.left + rect.width / 2;
               mouseMode.cursorY = rect.top + rect.height / 2;
@@ -1446,103 +1581,88 @@ public final class MainActivity extends Activity {
             y = Math.min(Math.max(y, rect.top), rect.top + rect.height - 1);
             mouseMode.cursorX = x;
             mouseMode.cursorY = y;
-            if (mouseMode.leftHeld) mouseMode.leftMoved = true;
+            for (const state of Object.values(mouseMode.buttons)) {
+              if (!state.held) continue;
+              state.moved = true;
+              // Dragging with the button held: no lock, so stop the ring.
+              if (state.timer) {
+                window.clearTimeout(state.timer);
+                state.timer = 0;
+                updateMouseButtons();
+              }
+            }
             updateMouseCursor();
             mouseAction('move', x, y);
           };
 
-          const clearLeftLockTimer = () => {
-            if (mouseMode.lockTimer) window.clearTimeout(mouseMode.lockTimer);
-            mouseMode.lockTimer = 0;
+          // Holding L or R for 1 s (without moving the cursor) locks it down,
+          // shown by the ring around the button filling up; the next tap on
+          // that button releases it.
+          const BUTTON_LOCK_MS = 1000;
+
+          const clearButtonLockTimer = (state) => {
+            if (state.timer) window.clearTimeout(state.timer);
+            state.timer = 0;
           };
 
-          const mouseLeftDown = () => {
-            if (mouseMode.leftLocked) {
-              // Tap while drag-locked: release the button when this tap ends.
-              mouseMode.leftLocked = false;
-              mouseMode.leftUnlockPending = true;
+          const mouseButtonDown = (button) => {
+            const state = mouseMode.buttons[button];
+            if (state.locked) {
+              // Tap while locked: release the button when this tap ends.
+              state.locked = false;
+              state.unlockPending = true;
               updateMouseButtons();
               return;
             }
-            mouseMode.leftHeld = true;
-            mouseMode.leftLockArmed = false;
-            mouseMode.leftMoved = false;
-            mouseAction('down', mouseMode.cursorX, mouseMode.cursorY, 0);
-            clearLeftLockTimer();
-            mouseMode.lockTimer = window.setTimeout(() => {
-              mouseMode.lockTimer = 0;
-              if (!mouseMode.leftHeld || mouseMode.leftMoved) return;
-              mouseMode.leftLockArmed = true;
-              navigator.vibrate?.(15);
+            state.held = true;
+            state.armed = false;
+            state.moved = false;
+            mouseAction('down', mouseMode.cursorX, mouseMode.cursorY, button);
+            clearButtonLockTimer(state);
+            state.timer = window.setTimeout(() => {
+              state.timer = 0;
+              if (state.held && !state.moved) {
+                state.armed = true;
+                navigator.vibrate?.(20);
+              }
               updateMouseButtons();
-            }, 500);
+            }, BUTTON_LOCK_MS);
             updateMouseButtons();
           };
 
-          const mouseLeftUp = (cancelled) => {
-            clearLeftLockTimer();
-            if (mouseMode.leftUnlockPending) {
-              mouseMode.leftUnlockPending = false;
-              mouseMode.leftHeld = false;
-              mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 0);
+          const mouseButtonUp = (button, cancelled) => {
+            const state = mouseMode.buttons[button];
+            clearButtonLockTimer(state);
+            if (state.unlockPending) {
+              state.unlockPending = false;
+              state.held = false;
+              mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, button);
               updateMouseButtons();
               return;
             }
-            if (mouseMode.leftLocked) {
-              // Locked with the lock button while L was pressed: keep holding.
+            if (!state.held) return;
+            if (!cancelled && state.armed && !state.moved) {
+              state.armed = false;
+              state.locked = true;
               updateMouseButtons();
               return;
             }
-            if (!mouseMode.leftHeld) return;
-            if (!cancelled && mouseMode.leftLockArmed && !mouseMode.leftMoved) {
-              // Long press without movement: keep the button down for one-finger drags.
-              mouseMode.leftLockArmed = false;
-              mouseMode.leftLocked = true;
-              updateMouseButtons();
-              return;
-            }
-            mouseMode.leftHeld = false;
-            mouseMode.leftLockArmed = false;
-            mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 0);
-            updateMouseButtons();
-          };
-
-          // The lock button holds the left button down (for drags and selections)
-          // until it, or L, is tapped again.
-          const toggleLeftLock = () => {
-            clearLeftLockTimer();
-            mouseMode.leftLockArmed = false;
-            mouseMode.leftUnlockPending = false;
-            if (mouseMode.leftLocked) {
-              mouseMode.leftLocked = false;
-              if (mouseMode.leftHeld) {
-                mouseMode.leftHeld = false;
-                mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 0);
-              }
-            } else {
-              mouseMode.leftLocked = true;
-              if (!mouseMode.leftHeld) {
-                mouseMode.leftHeld = true;
-                mouseMode.leftMoved = false;
-                mouseAction('down', mouseMode.cursorX, mouseMode.cursorY, 0);
-              }
-            }
-            navigator.vibrate?.(15);
+            state.held = false;
+            state.armed = false;
+            mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, button);
             updateMouseButtons();
           };
 
           const releaseMouseButtons = () => {
-            clearLeftLockTimer();
             for (const held of [0, 2, 1]) {
               if (mouse.buttons & mouseButtonMask(held)) {
                 mouseAction('up', mouse.lastX, mouse.lastY, held);
               }
             }
-            mouseMode.leftHeld = false;
-            mouseMode.leftLocked = false;
-            mouseMode.leftLockArmed = false;
-            mouseMode.leftUnlockPending = false;
-            mouseMode.rightHeld = false;
+            for (const state of Object.values(mouseMode.buttons)) {
+              clearButtonLockTimer(state);
+              Object.assign(state, { held: false, locked: false, armed: false, unlockPending: false });
+            }
             mouseMode.touches.clear();
             updateMouseButtons();
           };
@@ -1553,8 +1673,27 @@ public final class MainActivity extends Activity {
             return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
           };
 
+          // Controls the page marks as app UI (e.g. the remote desktop's file
+          // bars) keep normal touch behaviour in mouse mode.
+          const appUiTouchIds = new Set();
+          const isAppUiEvent = (event) => {
+            const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+            return path.some((node) => node?.hasAttribute?.('data-your-workspace-ui'));
+          };
+
           const handleMouseModeTouch = (event) => {
             if (!mouseMode.enabled) return;
+            const changed = Array.from(event.changedTouches || []);
+            if (event.type === 'touchstart' && isAppUiEvent(event)) {
+              for (const touch of changed) appUiTouchIds.add(touch.identifier);
+              return;
+            }
+            if (changed.length && changed.every((touch) => appUiTouchIds.has(touch.identifier))) {
+              if (event.type === 'touchend' || event.type === 'touchcancel') {
+                for (const touch of changed) appUiTouchIds.delete(touch.identifier);
+              }
+              return;
+            }
             if (event.cancelable) event.preventDefault();
             event.stopImmediatePropagation();
             const type = event.type;
@@ -1566,9 +1705,7 @@ public final class MainActivity extends Activity {
                 const pageTouches = Array.from(mouseMode.touches.values())
                   .filter((info) => info.role === 'cursor' || info.role === 'anchor');
                 let role = 'cursor';
-                if (pointInElement(mouseMode.lockButton, x, y)) {
-                  role = 'lock';
-                } else if (pointInElement(mouseMode.left, x, y)) {
+                if (pointInElement(mouseMode.left, x, y)) {
                   role = 'left';
                 } else if (pointInElement(mouseMode.right, x, y)) {
                   role = 'right';
@@ -1588,14 +1725,10 @@ public final class MainActivity extends Activity {
                   startedAt: performance.now(),
                   moved: false
                 });
-                if (role === 'lock') {
-                  toggleLeftLock();
-                } else if (role === 'left') {
-                  mouseLeftDown();
+                if (role === 'left') {
+                  mouseButtonDown(0);
                 } else if (role === 'right') {
-                  mouseMode.rightHeld = true;
-                  mouseAction('down', mouseMode.cursorX, mouseMode.cursorY, 2);
-                  updateMouseButtons();
+                  mouseButtonDown(2);
                 }
                 continue;
               }
@@ -1625,13 +1758,9 @@ public final class MainActivity extends Activity {
               mouseMode.touches.delete(touch.identifier);
               const cancelled = type === 'touchcancel';
               if (info.role === 'left') {
-                mouseLeftUp(cancelled);
+                mouseButtonUp(0, cancelled);
               } else if (info.role === 'right') {
-                if (mouseMode.rightHeld) {
-                  mouseMode.rightHeld = false;
-                  mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 2);
-                  updateMouseButtons();
-                }
+                mouseButtonUp(2, cancelled);
               } else if (info.role === 'cursor'
                   && !cancelled
                   && !info.moved
@@ -1647,7 +1776,7 @@ public final class MainActivity extends Activity {
           // Keep real touch-derived pointer and mouse events away from the page so
           // only the emulated mouse reaches it.
           const blockNativePointerEvents = (event) => {
-            if (!mouseMode.enabled || !event.isTrusted) return;
+            if (!mouseMode.enabled || !event.isTrusted || isAppUiEvent(event)) return;
             if (event.pointerType === 'mouse' || event.pointerType === 'pen') return;
             event.stopImmediatePropagation();
             if (event.cancelable) event.preventDefault();
@@ -1684,13 +1813,24 @@ public final class MainActivity extends Activity {
             } else {
               releaseMouseButtons();
               if (mouseMode.host) mouseMode.host.style.display = 'none';
+              if (!mouseMode.keyboardLocked) restoreKeyboardInputModes();
+            }
+            return true;
+          };
+
+          const setKeyboardLocked = (locked) => {
+            if (locked === mouseMode.keyboardLocked) return true;
+            mouseMode.keyboardLocked = locked;
+            if (locked) {
+              suppressKeyboardInDocument();
+            } else if (!mouseMode.enabled) {
               restoreKeyboardInputModes();
             }
             return true;
           };
 
           const bridge = {
-            version: 12,
+            version: 17,
             forceKeyboard,
             installRdpGestures,
             installDesktopGestures,
@@ -1707,6 +1847,9 @@ public final class MainActivity extends Activity {
             },
             setMouseMode(enabled, viewWidth) {
               return setMouseMode(Boolean(enabled), Number(viewWidth) || 0);
+            },
+            setKeyboardLocked(locked) {
+              return setKeyboardLocked(Boolean(locked));
             },
             setModifiers(control, shift) {
               const nextControl = Boolean(control);
@@ -1743,6 +1886,8 @@ public final class MainActivity extends Activity {
     private final Set<WebView> rdpWebViews = Collections.newSetFromMap(new WeakHashMap<>());
     private FrameLayout contentFrame;
     private Button disconnectButton;
+    private Button uploadButton;
+    private WebView uploadTarget;
     private LinearLayout zoomOverlay;
     private TextView zoomPercentLabel;
     private SeekBar zoomSlider;
@@ -1752,6 +1897,15 @@ public final class MainActivity extends Activity {
     private Button controlButton;
     private Button shiftButton;
     private Button mouseModeButton;
+    private Button keyboardLockButton;
+    private Button fullscreenButton;
+    private boolean fullscreenEnabled;
+    /** Keyboard lock: KEYBOARD_UNLOCKED, KEYBOARD_LOCKED_OPEN or KEYBOARD_LOCKED_HIDDEN. */
+    private int keyboardLock = KEYBOARD_UNLOCKED;
+    private boolean imeShown;
+    /** IME height kept as padding while a locked-open keyboard is being brought back. */
+    private int heldImeBottom;
+    private long imeHoldStartedAt;
     private boolean controlLocked;
     private boolean shiftLocked;
     private boolean keepAliveEnabled;
@@ -1768,6 +1922,13 @@ public final class MainActivity extends Activity {
             return;
         }
         if (webView == null || webView.getUrl() == null) {
+            return;
+        }
+        if (!fullscreenEnabled) {
+            // The address bar stays outside fullscreen; only the zoom slider hides.
+            if (zoomOverlay != null) {
+                zoomOverlay.setVisibility(View.GONE);
+            }
             return;
         }
         hideAddressBar();
@@ -1809,6 +1970,7 @@ public final class MainActivity extends Activity {
         );
         keepAliveEnabled = preferences.getBoolean(KEEP_ALIVE_KEY, false);
         mouseModeEnabled = preferences.getBoolean(MOUSE_MODE_KEY, false);
+        fullscreenEnabled = preferences.getBoolean(FULLSCREEN_KEY, false);
         loadProjects();
         setContentView(createContentView());
         configureSystemUi();
@@ -1863,7 +2025,7 @@ public final class MainActivity extends Activity {
         addressBar = new LinearLayout(this);
         addressBar.setOrientation(LinearLayout.HORIZONTAL);
         addressBar.setGravity(Gravity.CENTER_VERTICAL);
-        addressBar.setPadding(dp(8), dp(5), dp(8), dp(5));
+        addressBar.setPadding(dp(6), dp(4), dp(6), dp(4));
         addressBar.setBackgroundColor(Color.rgb(243, 243, 243));
 
         Button projectsButton = createToolbarButton("☰");
@@ -1874,6 +2036,14 @@ public final class MainActivity extends Activity {
         addressField = new EditText(this);
         addressField.setSingleLine(true);
         addressField.setTextSize(14);
+        addressField.setMinHeight(0);
+        addressField.setMinimumHeight(0);
+        addressField.setPadding(dp(12), 0, dp(12), 0);
+        GradientDrawable fieldBackground = new GradientDrawable();
+        fieldBackground.setColor(Color.WHITE);
+        fieldBackground.setCornerRadius(dp(10));
+        fieldBackground.setStroke(Math.max(1, dp(1) / 2), Color.argb(30, 0, 0, 0));
+        addressField.setBackground(fieldBackground);
         addressField.setHint("https://… or rdp://host");
         addressField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         addressField.setImeOptions(EditorInfo.IME_ACTION_GO);
@@ -1894,21 +2064,32 @@ public final class MainActivity extends Activity {
             }
             return false;
         });
-        addressBar.addView(
-            addressField,
-            new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
-        );
+        LinearLayout.LayoutParams fieldParams =
+            new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f);
+        fieldParams.setMargins(dp(4), 0, dp(4), 0);
+        addressBar.addView(addressField, fieldParams);
 
         Button reloadButton = createToolbarButton("↻");
         reloadButton.setContentDescription("Reload code-server");
         reloadButton.setOnClickListener(view -> webView.reload());
         addressBar.addView(reloadButton);
 
+        uploadButton = createToolbarButton("⇪");
+        uploadButton.setContentDescription("Upload files to the remote desktop");
+        uploadButton.setOnClickListener(view -> pickFilesToUpload());
+        uploadButton.setVisibility(View.GONE);
+        addressBar.addView(uploadButton);
+
         disconnectButton = createToolbarButton("⏏");
         disconnectButton.setContentDescription("Disconnect the remote desktop");
         disconnectButton.setOnClickListener(view -> disconnectActiveRdpSession());
         disconnectButton.setVisibility(View.GONE);
         addressBar.addView(disconnectButton);
+
+        fullscreenButton = createToolbarButton("⛶");
+        fullscreenButton.setOnClickListener(view -> setFullscreenEnabled(!fullscreenEnabled));
+        addressBar.addView(fullscreenButton);
+        updateFullscreenButton();
 
         Button settingsButton = createToolbarButton("⚙");
         settingsButton.setContentDescription("Settings");
@@ -1919,7 +2100,7 @@ public final class MainActivity extends Activity {
             addressBar,
             new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(56)
+                dp(ADDRESS_BAR_HEIGHT_DP)
             )
         );
         // Raised so it can float above a remote desktop (see updateAddressBarOverlay).
@@ -1973,8 +2154,18 @@ public final class MainActivity extends Activity {
 
         Button keyboardButton = createKeyButton("KB");
         keyboardButton.setContentDescription("Force show keyboard");
-        keyboardButton.setOnClickListener(view -> forceShowKeyboard());
+        keyboardButton.setOnClickListener(view -> {
+            if (keyboardLock == KEYBOARD_LOCKED_HIDDEN) {
+                Toast.makeText(this, "Keyboard is locked hidden", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            forceShowKeyboard();
+        });
         keyRow.addView(keyboardButton, keyLayoutParams(dp(54)));
+
+        keyboardLockButton = createKeyButton("⌨🔓");
+        keyboardLockButton.setOnClickListener(view -> toggleKeyboardLock());
+        keyRow.addView(keyboardLockButton, keyLayoutParams(dp(58)));
 
         mouseModeButton = createKeyButton("🖱");
         mouseModeButton.setOnClickListener(view -> setMouseModeEnabled(!mouseModeEnabled));
@@ -2028,6 +2219,7 @@ public final class MainActivity extends Activity {
         );
 
         updateModifierButtons();
+        updateKeyboardLockButton();
         applyMouseMode();
         return root;
     }
@@ -2043,7 +2235,60 @@ public final class MainActivity extends Activity {
                 WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
             getWindow().setAttributes(attributes);
         }
-        hideSystemBars();
+        applySystemBars();
+    }
+
+    /**
+     * Fullscreen hides the system bars and lets the address bar auto-hide; the
+     * regular mode keeps both visible (the zoom slider still auto-hides).
+     */
+    private void setFullscreenEnabled(boolean enabled) {
+        fullscreenEnabled = enabled;
+        preferences.edit().putBoolean(FULLSCREEN_KEY, enabled).apply();
+        applySystemBars();
+        updateFullscreenButton();
+        if (enabled) {
+            // Hide the system bars now and the address bar five seconds later.
+            showAddressBarTemporarily();
+        } else if (addressBar != null) {
+            addressBar.setVisibility(View.VISIBLE);
+            updateAddressBarOverlay();
+        }
+        if (rootContainer != null) {
+            rootContainer.requestApplyInsets();
+        }
+    }
+
+    private void updateFullscreenButton() {
+        if (fullscreenButton == null) {
+            return;
+        }
+        fullscreenButton.setContentDescription(
+            fullscreenEnabled ? "Exit fullscreen" : "Enter fullscreen"
+        );
+        fullscreenButton.setTextColor(fullscreenEnabled ? ACCENT : Color.BLACK);
+    }
+
+    private void applySystemBars() {
+        if (fullscreenEnabled) {
+            hideSystemBars();
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            WindowInsetsController controller = getWindow().getInsetsController();
+            if (controller != null) {
+                controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_DEFAULT);
+                controller.show(WindowInsets.Type.systemBars());
+                int lightBars = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+                    | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+                controller.setSystemBarsAppearance(lightBars, lightBars);
+            }
+        } else {
+            getWindow().getDecorView().setSystemUiVisibility(
+                View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+                    | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+            );
+        }
     }
 
     private void showSettings() {
@@ -2057,11 +2302,22 @@ public final class MainActivity extends Activity {
         );
         keepAliveCheckBox.setChecked(keepAliveEnabled);
         int padding = dp(20);
-        keepAliveCheckBox.setPadding(padding, dp(8), padding, dp(8));
+        keepAliveCheckBox.setPadding(0, dp(8), 0, dp(8));
+
+        Button tokensButton = new Button(this);
+        tokensButton.setAllCaps(false);
+        tokensButton.setText("Cloudflare Access service tokens…");
+        tokensButton.setOnClickListener(view -> showServiceTokenManager());
+
+        LinearLayout settingsView = new LinearLayout(this);
+        settingsView.setOrientation(LinearLayout.VERTICAL);
+        settingsView.setPadding(padding, dp(4), padding, 0);
+        settingsView.addView(keepAliveCheckBox);
+        settingsView.addView(tokensButton);
 
         new AlertDialog.Builder(this)
             .setTitle(boldText("Settings"))
-            .setView(keepAliveCheckBox)
+            .setView(settingsView)
             .setPositiveButton("Done", (dialog, which) -> {
                 setKeepAliveEnabled(keepAliveCheckBox.isChecked());
             })
@@ -2070,6 +2326,112 @@ public final class MainActivity extends Activity {
             })
             .setNegativeButton("Cancel", null)
             .show();
+    }
+
+    /** Lists the saved Cloudflare Access service tokens; tap one to edit or delete it. */
+    private void showServiceTokenManager() {
+        List<ServiceTokenStore.ServiceToken> tokens = ServiceTokenStore.list(this);
+        List<CharSequence> labels = new ArrayList<>();
+        labels.add("+ Add service token");
+        for (ServiceTokenStore.ServiceToken token : tokens) {
+            labels.add(token.name + "  ·  " + token.maskedClientId());
+        }
+        new AlertDialog.Builder(this)
+            .setTitle(boldText("Cloudflare Access service tokens"))
+            .setItems(labels.toArray(new CharSequence[0]), (dialog, which) -> {
+                if (which == 0) {
+                    showServiceTokenEditor(null);
+                } else {
+                    showServiceTokenActions(tokens.get(which - 1));
+                }
+            })
+            .setNegativeButton("Done", null)
+            .show();
+    }
+
+    private void showServiceTokenActions(ServiceTokenStore.ServiceToken token) {
+        new AlertDialog.Builder(this)
+            .setTitle(boldText(token.name))
+            .setMessage("Client ID " + token.maskedClientId()
+                + "\nThe client secret is stored encrypted and is not shown.")
+            .setPositiveButton("Edit", (dialog, which) -> showServiceTokenEditor(token))
+            .setNeutralButton("Delete", (dialog, which) -> new AlertDialog.Builder(this)
+                .setTitle(boldText("Delete " + token.name + "?"))
+                .setMessage("Projects that use it go back to browser sign-in.")
+                .setPositiveButton("Delete", (confirm, button) -> {
+                    ServiceTokenStore.delete(this, token.id);
+                    showServiceTokenManager();
+                })
+                .setNegativeButton("Cancel", null)
+                .show())
+            .setNegativeButton("Cancel", null)
+            .show();
+    }
+
+    /** Adds a service token, or edits one (an empty secret keeps the saved one). */
+    private void showServiceTokenEditor(ServiceTokenStore.ServiceToken existing) {
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(dp(20), dp(4), dp(20), 0);
+        EditText nameField = new EditText(this);
+        nameField.setSingleLine(true);
+        nameField.setHint("Name, e.g. Home");
+        EditText idField = new EditText(this);
+        idField.setSingleLine(true);
+        idField.setHint("Client ID (….access)");
+        idField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        EditText secretField = new EditText(this);
+        secretField.setSingleLine(true);
+        secretField.setHint(existing == null ? "Client secret" : "Client secret (leave empty to keep)");
+        secretField.setInputType(
+            InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD
+        );
+        if (existing != null) {
+            nameField.setText(existing.name);
+            idField.setText(existing.clientId);
+        }
+        form.addView(nameField);
+        form.addView(idField);
+        form.addView(secretField);
+        TextView note = new TextView(this);
+        note.setTextSize(12);
+        note.setText("Stored encrypted with the Android Keystore and excluded from backups.");
+        form.addView(note);
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+            .setTitle(boldText(existing == null ? "Add service token" : "Edit service token"))
+            .setView(form)
+            .setPositiveButton("Save", null)
+            .setNegativeButton("Cancel", null)
+            .create();
+        dialog.setOnShowListener(shown -> dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+            .setOnClickListener(view -> {
+                String name = nameField.getText().toString().trim();
+                String clientId = idField.getText().toString().trim();
+                String secret = secretField.getText().toString().trim();
+                if (secret.isEmpty() && existing != null) {
+                    secret = existing.clientSecret;
+                }
+                if (clientId.isEmpty() || secret.isEmpty()) {
+                    Toast.makeText(this, "Enter the client ID and secret", Toast.LENGTH_SHORT)
+                        .show();
+                    return;
+                }
+                if (name.isEmpty()) {
+                    name = "Service token " + (ServiceTokenStore.list(this).size() + 1);
+                }
+                ServiceTokenStore.save(
+                    this,
+                    existing == null ? null : existing.id,
+                    name,
+                    clientId,
+                    secret
+                );
+                dialog.dismiss();
+                Toast.makeText(this, "Service token saved", Toast.LENGTH_SHORT).show();
+                showServiceTokenManager();
+            }));
+        dialog.show();
     }
 
     private void setKeepAliveEnabled(boolean enabled) {
@@ -2094,9 +2456,16 @@ public final class MainActivity extends Activity {
         ).show();
     }
 
+    /**
+     * Runs the foreground keep-alive service while session keep-alive is on or a
+     * remote desktop is open: without it Android freezes the app in the
+     * background, which stops the remote desktop gateway and drops the session.
+     */
     private void applyKeepAliveMode() {
+        boolean remoteDesktopOpen = !rdpWebViews.isEmpty();
+        KeepAliveService.remoteDesktopActive = remoteDesktopOpen;
         Intent serviceIntent = new Intent(this, KeepAliveService.class);
-        if (keepAliveEnabled) {
+        if (keepAliveEnabled || remoteDesktopOpen) {
             startForegroundService(serviceIntent);
         } else {
             stopService(serviceIntent);
@@ -2170,11 +2539,12 @@ public final class MainActivity extends Activity {
         if (target == null) {
             return;
         }
+        boolean important = keepAliveEnabled || rdpWebViews.contains(target);
         target.setRendererPriorityPolicy(
-            keepAliveEnabled
+            important
                 ? WebView.RENDERER_PRIORITY_IMPORTANT
                 : WebView.RENDERER_PRIORITY_BOUND,
-            !keepAliveEnabled
+            !important
         );
     }
 
@@ -2205,11 +2575,114 @@ public final class MainActivity extends Activity {
         if (requestCode == OVERLAY_PERMISSION_REQUEST) {
             applyKeepAliveMode();
             requestBatteryOptimizationExemption();
+        } else if (requestCode == UPLOAD_FILES_REQUEST) {
+            WebView target = uploadTarget;
+            uploadTarget = null;
+            if (resultCode == RESULT_OK && data != null && target != null
+                && rdpWebViews.contains(target)) {
+                offerUploads(target, data);
+            }
         }
     }
 
     /**
-     * The app always runs fullscreen in sticky immersive mode. An edge swipe then
+     * Picks device files for the remote desktop in front. They are put on the
+     * remote clipboard, to be pasted (Ctrl+V) in Windows.
+     */
+    private void pickFilesToUpload() {
+        if (webView == null || !rdpWebViews.contains(webView)) {
+            return;
+        }
+        uploadTarget = webView;
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT)
+            .addCategory(Intent.CATEGORY_OPENABLE)
+            .setType("*/*")
+            .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+        try {
+            startActivityForResult(intent, UPLOAD_FILES_REQUEST);
+        } catch (android.content.ActivityNotFoundException exception) {
+            uploadTarget = null;
+            Toast.makeText(this, "No file picker available", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void offerUploads(WebView target, Intent data) {
+        List<Uri> uris = new ArrayList<>();
+        if (data.getClipData() != null) {
+            for (int index = 0; index < data.getClipData().getItemCount(); index++) {
+                uris.add(data.getClipData().getItemAt(index).getUri());
+            }
+        } else if (data.getData() != null) {
+            uris.add(data.getData());
+        }
+        if (uris.isEmpty()) {
+            return;
+        }
+        RdpGateway gateway;
+        try {
+            gateway = RdpGateway.get(this);
+        } catch (IOException exception) {
+            Toast.makeText(this, "Could not prepare the upload", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        JSONArray items = new JSONArray();
+        for (Uri uri : uris) {
+            String name = "file";
+            long size = -1L;
+            try (android.database.Cursor cursor = getContentResolver().query(
+                uri,
+                new String[] {
+                    android.provider.OpenableColumns.DISPLAY_NAME,
+                    android.provider.OpenableColumns.SIZE
+                },
+                null,
+                null,
+                null
+            )) {
+                if (cursor != null && cursor.moveToFirst()) {
+                    if (!cursor.isNull(0)) {
+                        name = cursor.getString(0);
+                    }
+                    if (!cursor.isNull(1)) {
+                        size = cursor.getLong(1);
+                    }
+                }
+            } catch (RuntimeException ignored) {
+                // Keep the defaults.
+            }
+            String id = gateway.stageUpload(
+                () -> {
+                    java.io.InputStream stream = getContentResolver().openInputStream(uri);
+                    if (stream == null) {
+                        throw new IOException("Could not open " + uri);
+                    }
+                    return stream;
+                },
+                size
+            );
+            try {
+                JSONObject item = new JSONObject();
+                item.put("id", id);
+                item.put("name", DownloadSaver.safeName(name));
+                item.put("size", size);
+                items.put(item);
+            } catch (Exception ignored) {
+                // Plain values.
+            }
+        }
+        target.evaluateJavascript(
+            "window.__rdpUploadFromApp ? (window.__rdpUploadFromApp(" + items + "), true) : false",
+            value -> {
+                if (!"true".equals(value)) {
+                    Toast.makeText(this, "The remote desktop is not ready", Toast.LENGTH_SHORT)
+                        .show();
+                }
+            }
+        );
+    }
+
+    /**
+     * Fullscreen runs in sticky immersive mode. An edge swipe then
      * only shows translucent, temporary system bars (never the notification shade)
      * and is still delivered to the app, which answers the first swipe with its own
      * address bar and dismisses the system bars again; see EdgeGestureLayout.
@@ -2238,9 +2711,13 @@ public final class MainActivity extends Activity {
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
+        if (hasFocus && keyboardLock == KEYBOARD_LOCKED_OPEN && !imeShown) {
+            addressBarHandler.removeCallbacks(reshowLockedKeyboard);
+            addressBarHandler.postDelayed(reshowLockedKeyboard, 300L);
+        }
         if (hasFocus) {
             // Dialogs and other windows can bring the system bars back.
-            hideSystemBars();
+            applySystemBars();
         }
     }
 
@@ -2254,32 +2731,169 @@ public final class MainActivity extends Activity {
             // cutout strip. Only the address bar steps below a top cutout, and side
             // cutouts in landscape keep their padding.
             Insets cutout = insets.getInsets(WindowInsets.Type.displayCutout());
+            // Outside fullscreen the visible system bars also take their space.
+            Insets bars = fullscreenEnabled
+                ? Insets.NONE
+                : insets.getInsets(WindowInsets.Type.systemBars());
             view.setPadding(
-                cutout.left,
+                Math.max(cutout.left, bars.left),
                 0,
-                cutout.right,
-                Math.max(cutout.bottom, ime.bottom)
+                Math.max(cutout.right, bars.right),
+                Math.max(Math.max(cutout.bottom, bars.bottom), heldKeyboardInset(ime.bottom))
             );
-            applyAddressBarTopInset(cutout.top);
+            applyAddressBarTopInset(Math.max(cutout.top, bars.top));
         } else {
             int bottomInset = insets.getSystemWindowInsetBottom();
             int keyboardInset = bottomInset > dp(120) ? bottomInset : 0;
             imeVisible = keyboardInset > 0;
-            view.setPadding(0, 0, 0, keyboardInset);
+            view.setPadding(0, 0, 0, heldKeyboardInset(keyboardInset));
         }
         if (webView instanceof RdpInputWebView) {
             ((RdpInputWebView) webView).setImeVisible(imeVisible);
         }
+        onImeVisibilityChanged(imeVisible);
+    }
+
+    /**
+     * While the keyboard is locked open and something closes it (a tap on a
+     * remote desktop canvas, for instance), keeps its height as padding until
+     * it is back, so the page and a remote desktop are not resized meanwhile.
+     */
+    private int heldKeyboardInset(int imeBottom) {
+        if (imeBottom > 0) {
+            heldImeBottom = imeBottom;
+            imeHoldStartedAt = 0L;
+            return imeBottom;
+        }
+        if (keyboardLock != KEYBOARD_LOCKED_OPEN || heldImeBottom <= 0 || !hasWindowFocus()) {
+            heldImeBottom = 0;
+            return 0;
+        }
+        long now = SystemClock.elapsedRealtime();
+        if (imeHoldStartedAt == 0L) {
+            imeHoldStartedAt = now;
+        } else if (now - imeHoldStartedAt > KEYBOARD_HOLD_TIMEOUT_MS) {
+            heldImeBottom = 0;
+            return 0;
+        }
+        return heldImeBottom;
+    }
+
+    private final Runnable reshowLockedKeyboard = () -> {
+        if (keyboardLock != KEYBOARD_LOCKED_OPEN || imeShown || !hasWindowFocus()) {
+            return;
+        }
+        if (webView instanceof RdpInputWebView
+            && ((RdpInputWebView) webView).isForcedImeEnabled()) {
+            // Remote desktop typing: reopen the keyboard on the same connection.
+            ((RdpInputWebView) webView).reshowForcedIme();
+            return;
+        }
+        forceShowKeyboard(true);
+    };
+
+    private final Runnable releaseKeyboardHold = () -> {
+        if (imeShown || heldImeBottom <= 0) {
+            return;
+        }
+        heldImeBottom = 0;
+        if (rootContainer != null) {
+            rootContainer.requestApplyInsets();
+        }
+    };
+
+    private void onImeVisibilityChanged(boolean visible) {
+        boolean wasShown = imeShown;
+        imeShown = visible;
+        if (wasShown && !visible && keyboardLock == KEYBOARD_LOCKED_OPEN && hasWindowFocus()) {
+            addressBarHandler.removeCallbacks(reshowLockedKeyboard);
+            addressBarHandler.postDelayed(reshowLockedKeyboard, KEYBOARD_RESHOW_DELAY_MS);
+            addressBarHandler.removeCallbacks(releaseKeyboardHold);
+            addressBarHandler.postDelayed(releaseKeyboardHold, KEYBOARD_HOLD_TIMEOUT_MS + 100L);
+        }
+    }
+
+    /**
+     * Locks the keyboard in its current state: open stays open (it is brought
+     * back whenever it closes), hidden stays hidden (pages cannot raise it).
+     * Tapping again unlocks.
+     */
+    private void toggleKeyboardLock() {
+        String message;
+        if (keyboardLock != KEYBOARD_UNLOCKED) {
+            keyboardLock = KEYBOARD_UNLOCKED;
+            message = "Keyboard unlocked";
+        } else if (imeShown) {
+            keyboardLock = KEYBOARD_LOCKED_OPEN;
+            message = "Keyboard locked open";
+        } else {
+            keyboardLock = KEYBOARD_LOCKED_HIDDEN;
+            message = "Keyboard locked hidden";
+        }
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
+        if (activeSessionKey != null) {
+            preferences.edit()
+                .putInt(projectStateKey(KEYBOARD_LOCK_KEY, activeSessionKey), keyboardLock)
+                .apply();
+        }
+        heldImeBottom = keyboardLock == KEYBOARD_LOCKED_OPEN ? heldImeBottom : 0;
+        if (keyboardLock == KEYBOARD_LOCKED_HIDDEN) {
+            hideSystemKeyboard();
+        }
+        if (webView instanceof RdpInputWebView) {
+            // Re-evaluate whether the WebView accepts text input.
+            InputMethodManager inputMethodManager =
+                (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (inputMethodManager != null) {
+                inputMethodManager.restartInput(webView);
+            }
+        }
+        for (ProjectSession session : projectSessions.values()) {
+            syncMouseMode(session.webView);
+        }
+        if (webView != null && activeSessionKey == null) {
+            syncMouseMode(webView);
+        }
+        if (rootContainer != null) {
+            rootContainer.requestApplyInsets();
+        }
+        updateKeyboardLockButton();
+    }
+
+    private void updateKeyboardLockButton() {
+        if (keyboardLockButton == null) {
+            return;
+        }
+        String label;
+        String description;
+        if (keyboardLock == KEYBOARD_LOCKED_OPEN) {
+            label = "⌨🔒";
+            description = "Keyboard locked open. Tap to unlock.";
+        } else if (keyboardLock == KEYBOARD_LOCKED_HIDDEN) {
+            label = "🚫⌨";
+            description = "Keyboard locked hidden. Tap to unlock.";
+        } else {
+            label = "⌨🔓";
+            description = "Lock the keyboard open or hidden";
+        }
+        keyboardLockButton.setText(label);
+        keyboardLockButton.setContentDescription(description);
+        keyboardLockButton.setBackgroundTintList(ColorStateList.valueOf(
+            keyboardLock == KEYBOARD_UNLOCKED ? KEY_BACKGROUND : ACCENT
+        ));
+        keyboardLockButton.setTextColor(
+            keyboardLock == KEYBOARD_UNLOCKED ? Color.BLACK : Color.WHITE
+        );
     }
 
     private void applyAddressBarTopInset(int topInset) {
         if (addressBar == null) {
             return;
         }
-        addressBar.setPadding(dp(8), dp(5) + topInset, dp(8), dp(5));
+        addressBar.setPadding(dp(6), dp(4) + topInset, dp(6), dp(4));
         ViewGroup.LayoutParams params = addressBar.getLayoutParams();
-        if (params != null && params.height != dp(56) + topInset) {
-            params.height = dp(56) + topInset;
+        if (params != null && params.height != dp(ADDRESS_BAR_HEIGHT_DP) + topInset) {
+            params.height = dp(ADDRESS_BAR_HEIGHT_DP) + topInset;
             addressBar.setLayoutParams(params);
             updateAddressBarOverlay();
         }
@@ -2317,7 +2931,11 @@ public final class MainActivity extends Activity {
                 Message resultMsg
             ) {
                 // Links opened with window.open (e.g. terminal and editor links) go to
-                // the system browser instead of replacing the code-server page.
+                // the system browser instead of replacing the code-server page. A new
+                // window on the same site (code-server's New Window, a folder opened
+                // in a new window) becomes a new project session in the app.
+                String openerUrl = view.getUrl();
+                boolean openerIsRemoteDesktop = rdpWebViews.contains(view);
                 WebView popup = new WebView(view.getContext());
                 popup.setWebViewClient(new WebViewClient() {
                     private boolean handled;
@@ -2327,8 +2945,15 @@ public final class MainActivity extends Activity {
                             return;
                         }
                         handled = true;
-                        openExternalUrl(uri);
-                        popupView.post(() -> {
+                        if (!openerIsRemoteDesktop && sameSite(openerUrl, uri)) {
+                            String address = uri.toString();
+                            // The popup is never attached to a window, so its own
+                            // post() queue would never run: use the main handler.
+                            addressBarHandler.post(() -> openNewWindowAsProject(address));
+                        } else {
+                            openExternalUrl(uri);
+                        }
+                        addressBarHandler.post(() -> {
                             popupView.stopLoading();
                             popupView.destroy();
                         });
@@ -2361,7 +2986,11 @@ public final class MainActivity extends Activity {
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 // Remote desktop WebViews hold credentials in their JavaScript
                 // bridge, so they never leave the loopback gateway page.
-                return rdpWebViews.contains(view) && !isGatewayUrl(request.getUrl().toString());
+                if (rdpWebViews.contains(view)) {
+                    return !isGatewayUrl(request.getUrl().toString());
+                }
+                return request.isForMainFrame()
+                    && reauthorizeInsteadOfAccessLogin(view, request.getUrl());
             }
 
             @Override
@@ -2422,6 +3051,59 @@ public final class MainActivity extends Activity {
         webView.onResume();
         activeSessionKey = null;
         showZoomOf(null);
+        restoreInputModes(null);
+    }
+
+    /** Per-project preference key; pages outside a project use the global one. */
+    private static String projectStateKey(String base, String sessionKey) {
+        return sessionKey == null ? base : base + ":" + sessionKey;
+    }
+
+    private boolean mouseModeFor(String sessionKey) {
+        boolean global = preferences.getBoolean(MOUSE_MODE_KEY, false);
+        return sessionKey == null
+            ? global
+            : preferences.getBoolean(projectStateKey(MOUSE_MODE_KEY, sessionKey), global);
+    }
+
+    private int keyboardLockFor(String sessionKey) {
+        return sessionKey == null
+            ? KEYBOARD_UNLOCKED
+            : preferences.getInt(projectStateKey(KEYBOARD_LOCK_KEY, sessionKey), KEYBOARD_UNLOCKED);
+    }
+
+    private String sessionKeyOf(WebView target) {
+        if (target == webView) {
+            return activeSessionKey;
+        }
+        for (Map.Entry<String, ProjectSession> entry : projectSessions.entrySet()) {
+            if (entry.getValue().webView == target) {
+                return entry.getKey();
+            }
+        }
+        return null;
+    }
+
+    /** Applies the mouse mode and keyboard lock saved for the project in front. */
+    private void restoreInputModes(String sessionKey) {
+        mouseModeEnabled = mouseModeFor(sessionKey);
+        keyboardLock = keyboardLockFor(sessionKey);
+        heldImeBottom = 0;
+        updateKeyboardLockButton();
+        applyMouseMode();
+        if (webView instanceof RdpInputWebView) {
+            InputMethodManager inputMethodManager =
+                (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (inputMethodManager != null) {
+                inputMethodManager.restartInput(webView);
+            }
+        }
+        if (keyboardLock == KEYBOARD_LOCKED_HIDDEN) {
+            hideSystemKeyboard();
+        } else if (keyboardLock == KEYBOARD_LOCKED_OPEN && !imeShown) {
+            addressBarHandler.removeCallbacks(reshowLockedKeyboard);
+            addressBarHandler.postDelayed(reshowLockedKeyboard, 500L);
+        }
     }
 
     /** Makes the zoom slider show (and set) the zoom of the page in front. */
@@ -2602,6 +3284,10 @@ public final class MainActivity extends Activity {
     }
 
     private void forceShowKeyboard() {
+        forceShowKeyboard(false);
+    }
+
+    private void forceShowKeyboard(boolean quiet) {
         if (webView == null) {
             return;
         }
@@ -2613,13 +3299,15 @@ public final class MainActivity extends Activity {
             if (target != webView) {
                 return;
             }
-            Toast.makeText(
-                this,
-                "\"ironrdp\"".equals(value)
-                    ? "IronRDP focused"
-                    : "RDP canvas not found",
-                Toast.LENGTH_SHORT
-            ).show();
+            if (!quiet) {
+                Toast.makeText(
+                    this,
+                    "\"ironrdp\"".equals(value)
+                        ? "IronRDP focused"
+                        : "RDP canvas not found",
+                    Toast.LENGTH_SHORT
+                ).show();
+            }
             if (target instanceof RdpInputWebView) {
                 ((RdpInputWebView) target).showForcedIme(
                     "\"ironrdp\"".equals(value)
@@ -2639,7 +3327,7 @@ public final class MainActivity extends Activity {
             String username = AccessTokenStore.username(this, host);
             String password = AccessTokenStore.loadPassword(this, host);
             boolean ready = findProjectSession(normalized) != null
-                || (AccessTokenStore.loadToken(this, host) != null
+                || (AccessTokenStore.credential(this, host) != null
                     && !username.isEmpty()
                     && password != null
                     && !password.isEmpty());
@@ -2668,7 +3356,7 @@ public final class MainActivity extends Activity {
 
         activateProjectSession(normalized, targetSession, now);
         if (created || restoreSavedAddress) {
-            targetSession.webView.loadUrl(normalized);
+            loadProjectUrl(targetSession.webView, normalized);
         }
         evictExcessProjectSessions();
 
@@ -2714,6 +3402,8 @@ public final class MainActivity extends Activity {
             WebView view = createProjectWebView();
             view.addJavascriptInterface(rdpPageBridge, "YourWorkspaceRdp");
             rdpWebViews.add(view);
+            applyWebViewRendererPriority(view);
+            applyKeepAliveMode();
             session = new ProjectSession(view);
             projectSessions.put(normalized, session);
         }
@@ -2760,6 +3450,9 @@ public final class MainActivity extends Activity {
         case "login_required":
             rdpPanel.show(session.address, "Cloudflare sign-in expired. Sign in again to reconnect.");
             break;
+        case "file_saved":
+            Toast.makeText(this, "Saved to " + detail, Toast.LENGTH_SHORT).show();
+            break;
         case "failed":
             Toast.makeText(
                 this,
@@ -2770,6 +3463,86 @@ public final class MainActivity extends Activity {
         default:
             break;
         }
+    }
+
+    private final Map<WebView, Long> accessReauthorizedAt = new WeakHashMap<>();
+
+    /**
+     * Loads a web project. With a Cloudflare Access service token chosen for it,
+     * the app first authenticates natively and stores the CF_Authorization
+     * cookie Access returns, so the page and its WebSockets are authorized; the
+     * secret itself is not sent through the page unless no cookie came back.
+     */
+    private void loadProjectUrl(WebView target, String url) {
+        ServiceTokenStore.ServiceToken token = ServiceTokenStore.forProject(this, url);
+        if (token == null || RdpConnectionPanel.isRdpAddress(url)) {
+            target.loadUrl(url);
+            return;
+        }
+        new Thread(() -> {
+            ServiceTokenAuth.Result result = ServiceTokenAuth.authorize(url, token);
+            runOnUiThread(() -> {
+                if (!isProjectWebViewAlive(target)) {
+                    return;
+                }
+                CookieManager cookies = CookieManager.getInstance();
+                for (String cookie : result.cookies) {
+                    cookies.setCookie(url, cookie);
+                }
+                cookies.flush();
+                if (result.rejected) {
+                    Toast.makeText(
+                        this,
+                        "Cloudflare Access rejected the service token “" + token.name + "”",
+                        Toast.LENGTH_LONG
+                    ).show();
+                }
+                if (result.cookies.isEmpty()) {
+                    target.loadUrl(url, AccessCredential.service(token).headers());
+                } else {
+                    target.loadUrl(url);
+                }
+            });
+        }, "AccessServiceToken").start();
+    }
+
+    private boolean isProjectWebViewAlive(WebView target) {
+        if (target == webView) {
+            return true;
+        }
+        for (ProjectSession session : projectSessions.values()) {
+            if (session.webView == target) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * When a project with a service token is sent to the Cloudflare Access
+     * login (its session expired), authenticates again and reloads instead.
+     * At most once per 30 s per page, so a rejected token shows the login.
+     */
+    private boolean reauthorizeInsteadOfAccessLogin(WebView view, Uri url) {
+        if (!ServiceTokenAuth.isAccessLogin(url)) {
+            return false;
+        }
+        String sessionKey = sessionKeyOf(view);
+        if (sessionKey == null || ServiceTokenStore.forProject(this, sessionKey) == null) {
+            return false;
+        }
+        long now = SystemClock.elapsedRealtime();
+        Long last = accessReauthorizedAt.get(view);
+        if (last != null && now - last < 30_000L) {
+            return false;
+        }
+        accessReauthorizedAt.put(view, now);
+        String current = view.getUrl();
+        String destination = current != null && !ServiceTokenAuth.isAccessLogin(Uri.parse(current))
+            ? current
+            : sessionKey;
+        loadProjectUrl(view, destination);
+        return true;
     }
 
     private boolean isGatewayUrl(String url) {
@@ -2824,6 +3597,7 @@ public final class MainActivity extends Activity {
         activeSessionKey = sessionKey;
         targetSession.lastInactiveAt = 0L;
         showZoomOf(sessionKey);
+        restoreInputModes(sessionKey);
         webView.setVisibility(View.VISIBLE);
         webView.bringToFront();
         webView.onResume();
@@ -2843,10 +3617,11 @@ public final class MainActivity extends Activity {
             projectSessions.entrySet().iterator();
         while (iterator.hasNext()) {
             Map.Entry<String, ProjectSession> entry = iterator.next();
-            if (entry.getKey().equals(activeSessionKey)) {
+            ProjectSession session = entry.getValue();
+            if (entry.getKey().equals(activeSessionKey) || rdpWebViews.contains(session.webView)) {
+                // Remote desktops stay until they are disconnected.
                 continue;
             }
-            ProjectSession session = entry.getValue();
             if (session.lastInactiveAt > 0L
                 && now - session.lastInactiveAt >= PROJECT_SESSION_TTL_MS) {
                 iterator.remove();
@@ -2905,11 +3680,15 @@ public final class MainActivity extends Activity {
         rdpWebViews.remove(target);
         showBlankWebView();
         destroyWebView(target);
+        applyKeepAliveMode();
         updateAddressBarOverlay();
         rdpPanel.show(address, "Disconnected from the remote desktop.");
     }
 
     private void destroyWebView(WebView target) {
+        if (rdpWebViews.remove(target)) {
+            applyKeepAliveMode();
+        }
         appliedLayoutZoomSteps.remove(target);
         lastFinishedUrls.remove(target);
         if (webContainer != null) {
@@ -2966,15 +3745,17 @@ public final class MainActivity extends Activity {
         if (disconnectButton != null) {
             boolean rdpActive = webView != null && rdpWebViews.contains(webView);
             disconnectButton.setVisibility(rdpActive ? View.VISIBLE : View.GONE);
+            uploadButton.setVisibility(rdpActive ? View.VISIBLE : View.GONE);
         }
         if (contentFrame == null || addressBar == null) {
             return;
         }
-        boolean overlay = addressBar.getVisibility() == View.VISIBLE
+        boolean overlay = fullscreenEnabled
+            && addressBar.getVisibility() == View.VISIBLE
             && webView != null
             && rdpWebViews.contains(webView);
         ViewGroup.LayoutParams barParams = addressBar.getLayoutParams();
-        int barHeight = barParams != null && barParams.height > 0 ? barParams.height : dp(56);
+        int barHeight = barParams != null && barParams.height > 0 ? barParams.height : dp(ADDRESS_BAR_HEIGHT_DP);
         LinearLayout.LayoutParams frameParams =
             (LinearLayout.LayoutParams) contentFrame.getLayoutParams();
         int frameMargin = overlay ? -barHeight : 0;
@@ -3028,88 +3809,437 @@ public final class MainActivity extends Activity {
         preferences.edit().putString(PROJECTS_KEY, array.toString()).apply();
     }
 
+    /** Saved projects as cards: tap to open, ✎ to edit; new and save-current on top. */
     private void showProjectSwitcher() {
         long now = SystemClock.elapsedRealtime();
         cleanupExpiredProjectSessions(now);
 
-        List<CharSequence> choices = new ArrayList<>();
-        choices.add("+ Save current address");
-        for (ProjectProfile project : projects) {
-            choices.add(styledProjectLabel(project, false, isProjectSessionHot(project.url, now)));
-        }
-        choices.add("Manage saved projects");
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(dp(16), dp(14), dp(16), dp(8));
 
-        new AlertDialog.Builder(this)
-            .setTitle(boldText("Projects"))
-            .setItems(choices.toArray(new CharSequence[0]), (dialog, which) -> {
-                if (which == 0) {
-                    saveCurrentAsProject();
-                } else if (which <= projects.size()) {
-                    openProject(projects.get(which - 1));
-                } else {
-                    showProjectManager();
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        TextView title = new TextView(this);
+        title.setText("Projects");
+        title.setTextSize(20);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        title.setTextColor(Color.rgb(28, 28, 30));
+        header.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        Button saveCurrent = pillButton("Save current", false);
+        Button addNew = pillButton("＋ New", true);
+        header.addView(saveCurrent);
+        LinearLayout.LayoutParams addParams = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        addParams.setMarginStart(dp(8));
+        header.addView(addNew, addParams);
+        content.addView(header);
+
+        LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        list.setPadding(0, dp(12), 0, 0);
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(list);
+        content.addView(scroll, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+            .setView(content)
+            .setNegativeButton("Close", null)
+            .create();
+
+        if (projects.isEmpty()) {
+            TextView empty = new TextView(this);
+            empty.setText("No saved projects yet. Add one, or save the current address.");
+            empty.setTextSize(14);
+            empty.setTextColor(Color.rgb(110, 110, 115));
+            empty.setPadding(dp(4), dp(8), dp(4), dp(12));
+            list.addView(empty);
+        }
+        for (ProjectProfile project : projects) {
+            View card = projectCard(
+                project,
+                isProjectSessionHot(project.url, now),
+                () -> {
+                    dialog.dismiss();
+                    openProject(project);
+                },
+                () -> {
+                    dialog.dismiss();
+                    showProjectEditor(projects.indexOf(project), null);
                 }
-            })
-            .setNegativeButton("Cancel", null)
-            .show();
+            );
+            card.setTag(project);
+            list.addView(card);
+        }
+
+        saveCurrent.setOnClickListener(view -> {
+            String url = normalizeAddress(addressField.getText().toString());
+            if (url.isEmpty()) {
+                Toast.makeText(this, "Enter an address first", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            dialog.dismiss();
+            showProjectEditor(-1, url);
+        });
+        addNew.setOnClickListener(view -> {
+            dialog.dismiss();
+            showProjectEditor(-1, "");
+        });
+        dialog.show();
     }
 
-    private void saveCurrentAsProject() {
-        String url = normalizeAddress(addressField.getText().toString());
-        if (url.isEmpty()) {
-            Toast.makeText(this, "Enter an address first", Toast.LENGTH_SHORT).show();
-            return;
+    private View projectCard(
+        ProjectProfile project,
+        boolean hot,
+        Runnable open,
+        Runnable edit
+    ) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.HORIZONTAL);
+        card.setGravity(Gravity.CENTER_VERTICAL);
+        card.setPadding(dp(4), dp(10), dp(6), dp(10));
+        GradientDrawable shape = new GradientDrawable();
+        shape.setColor(Color.rgb(245, 245, 248));
+        shape.setCornerRadius(dp(12));
+        card.setBackground(new RippleDrawable(
+            ColorStateList.valueOf(Color.argb(30, 0, 0, 0)),
+            shape,
+            null
+        ));
+        card.setOnClickListener(view -> open.run());
+
+        TextView handle = new TextView(this);
+        handle.setText("≡");
+        handle.setTextSize(20);
+        handle.setTextColor(Color.rgb(150, 150, 155));
+        handle.setGravity(Gravity.CENTER);
+        handle.setContentDescription("Drag to reorder " + project.name);
+        handle.setOnTouchListener(this::dragProjectCard);
+        card.addView(handle, new LinearLayout.LayoutParams(dp(28), dp(40)));
+
+        LinearLayout text = new LinearLayout(this);
+        text.setOrientation(LinearLayout.VERTICAL);
+        TextView name = new TextView(this);
+        name.setText(project.name);
+        name.setTextSize(16);
+        name.setTypeface(Typeface.DEFAULT_BOLD);
+        name.setTextColor(Color.rgb(28, 28, 30));
+        name.setSingleLine(true);
+        name.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        text.addView(name);
+        TextView address = new TextView(this);
+        address.setText(project.url);
+        address.setTextSize(12);
+        address.setTextColor(Color.rgb(110, 110, 115));
+        address.setSingleLine(true);
+        address.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
+        text.addView(address);
+
+        List<String> tags = new ArrayList<>();
+        if (RdpConnectionPanel.isRdpAddress(project.url)) {
+            tags.add("RDP");
         }
+        ServiceTokenStore.ServiceToken token = ServiceTokenStore.forProject(this, project.url);
+        if (token != null) {
+            tags.add("🔑 " + token.name);
+        }
+        if (hot) {
+            tags.add("● Open");
+        }
+        if (!tags.isEmpty()) {
+            TextView tagView = new TextView(this);
+            tagView.setText(String.join("  ·  ", tags));
+            tagView.setTextSize(11);
+            tagView.setTextColor(ACCENT);
+            tagView.setPadding(0, dp(3), 0, 0);
+            tagView.setSingleLine(true);
+            tagView.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            text.addView(tagView);
+        }
+        card.addView(text, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        Button editButton = createToolbarButton("✎");
+        editButton.setContentDescription("Edit " + project.name);
+        editButton.setOnClickListener(view -> edit.run());
+        card.addView(editButton, new LinearLayout.LayoutParams(dp(40), dp(40)));
+
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        params.bottomMargin = dp(8);
+        card.setLayoutParams(params);
+        return card;
+    }
+
+    private float projectDragLastY;
+
+    /**
+     * Drag handle of a project card: the card follows the finger, neighbours
+     * move past it, and the new order is saved when the finger lifts.
+     */
+    private boolean dragProjectCard(View handle, MotionEvent event) {
+        View card = (View) handle.getParent();
+        LinearLayout list = (LinearLayout) card.getParent();
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                projectDragLastY = event.getRawY();
+                card.setElevation(dp(6));
+                list.getParent().requestDisallowInterceptTouchEvent(true);
+                return true;
+            case MotionEvent.ACTION_MOVE: {
+                float offset = card.getTranslationY() + event.getRawY() - projectDragLastY;
+                projectDragLastY = event.getRawY();
+                int index = list.indexOfChild(card);
+                int gap = dp(8);
+                if (offset > 0 && index < list.getChildCount() - 1) {
+                    View next = list.getChildAt(index + 1);
+                    if (offset > (next.getHeight() + gap) / 2f) {
+                        // Move the neighbour above instead of the dragged card,
+                        // which keeps receiving this touch.
+                        list.removeView(next);
+                        list.addView(next, index);
+                        offset -= next.getHeight() + gap;
+                    }
+                } else if (offset < 0 && index > 0) {
+                    View previous = list.getChildAt(index - 1);
+                    if (-offset > (previous.getHeight() + gap) / 2f) {
+                        list.removeView(previous);
+                        list.addView(previous, index);
+                        offset += previous.getHeight() + gap;
+                    }
+                }
+                card.setTranslationY(offset);
+                return true;
+            }
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_CANCEL:
+                card.animate().translationY(0f).setDuration(120).start();
+                card.setElevation(0f);
+                list.getParent().requestDisallowInterceptTouchEvent(false);
+                List<ProjectProfile> ordered = new ArrayList<>();
+                for (int position = 0; position < list.getChildCount(); position++) {
+                    Object tag = list.getChildAt(position).getTag();
+                    if (tag instanceof ProjectProfile) {
+                        ordered.add((ProjectProfile) tag);
+                    }
+                }
+                if (ordered.size() == projects.size() && !ordered.equals(projects)) {
+                    projects.clear();
+                    projects.addAll(ordered);
+                    persistProjects();
+                }
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private Button pillButton(String label, boolean primary) {
+        Button button = new Button(this);
+        button.setText(label);
+        button.setAllCaps(false);
+        button.setTextSize(13);
+        button.setMinHeight(0);
+        button.setMinimumHeight(0);
+        button.setMinWidth(0);
+        button.setMinimumWidth(0);
+        button.setPadding(dp(12), dp(6), dp(12), dp(6));
+        button.setStateListAnimator(null);
+        button.setTextColor(primary ? Color.WHITE : ACCENT);
+        GradientDrawable shape = new GradientDrawable();
+        shape.setCornerRadius(dp(16));
+        shape.setColor(primary ? ACCENT : Color.TRANSPARENT);
+        if (!primary) {
+            shape.setStroke(Math.max(1, dp(1)), ACCENT);
+        }
+        button.setBackground(new RippleDrawable(
+            ColorStateList.valueOf(Color.argb(40, 0, 0, 0)),
+            shape,
+            null
+        ));
+        return button;
+    }
+
+    /**
+     * Adds a project ({@code index} < 0, with {@code presetUrl} prefilled, e.g.
+     * the current address) or edits one: name, address and Cloudflare Access
+     * (browser sign-in or a saved service token).
+     */
+    private void showProjectEditor(int index, String presetUrl) {
+        ProjectProfile existing = index >= 0 ? projects.get(index) : null;
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(dp(20), dp(8), dp(20), 0);
 
         EditText nameField = new EditText(this);
         nameField.setSingleLine(true);
-        nameField.setHint("Project name");
-        nameField.setText("Project " + (projects.size() + 1));
-        nameField.selectAll();
+        nameField.setHint("Name");
+        EditText urlField = new EditText(this);
+        urlField.setSingleLine(true);
+        urlField.setHint("https://… or rdp://host");
+        urlField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        String initialUrl = existing != null ? existing.url : (presetUrl == null ? "" : presetUrl);
+        nameField.setText(existing != null
+            ? existing.name
+            : (initialUrl.isEmpty() ? "" : suggestedProjectName(initialUrl)));
+        urlField.setText(initialUrl);
+        form.addView(formLabel("Name"));
+        form.addView(nameField);
+        form.addView(formLabel("Address"));
+        form.addView(urlField);
 
-        new AlertDialog.Builder(this)
-            .setTitle(boldText("Save project"))
-            .setMessage(url)
-            .setView(nameField)
-            .setPositiveButton("Save", (dialog, which) -> {
+        List<ServiceTokenStore.ServiceToken> tokens = ServiceTokenStore.list(this);
+        List<String> choices = new ArrayList<>();
+        choices.add("Browser sign-in");
+        for (ServiceTokenStore.ServiceToken token : tokens) {
+            choices.add("Service token: " + token.name);
+        }
+        Spinner accessChoice = new Spinner(this);
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(
+            this,
+            android.R.layout.simple_spinner_dropdown_item,
+            choices
+        );
+        accessChoice.setAdapter(adapter);
+        String currentTokenId = initialUrl.isEmpty()
+            ? null
+            : ServiceTokenStore.projectTokenId(this, initialUrl);
+        for (int position = 0; position < tokens.size(); position++) {
+            if (tokens.get(position).id.equals(currentTokenId)) {
+                accessChoice.setSelection(position + 1);
+            }
+        }
+        form.addView(formLabel("Cloudflare Access"));
+        form.addView(accessChoice);
+        if (tokens.isEmpty()) {
+            TextView hint = new TextView(this);
+            hint.setText("Service tokens are added in Settings → Cloudflare Access service tokens.");
+            hint.setTextSize(12);
+            hint.setTextColor(Color.rgb(110, 110, 115));
+            form.addView(hint);
+        }
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(this)
+            .setTitle(boldText(existing != null ? "Edit project" : "New project"))
+            .setView(form)
+            .setPositiveButton("Save", null)
+            .setNegativeButton("Cancel", null);
+        if (existing != null) {
+            builder.setNeutralButton("Delete", (dialog, which) -> confirmProjectDeletion(index));
+        }
+        AlertDialog dialog = builder.create();
+        dialog.setOnShowListener(shown -> dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+            .setOnClickListener(view -> {
+                String url = normalizeAddress(urlField.getText().toString());
+                if (url.isEmpty()) {
+                    Toast.makeText(this, "Enter an address", Toast.LENGTH_SHORT).show();
+                    return;
+                }
                 String name = nameField.getText().toString().trim();
                 if (name.isEmpty()) {
-                    name = "Project " + (projects.size() + 1);
+                    name = suggestedProjectName(url);
                 }
-                projects.add(new ProjectProfile(name, url));
+                ProjectProfile saved = new ProjectProfile(name, url);
+                if (existing != null) {
+                    projects.set(index, saved);
+                } else {
+                    projects.add(saved);
+                }
                 persistProjects();
-            })
-            .setNegativeButton("Cancel", null)
+                int selected = accessChoice.getSelectedItemPosition();
+                ServiceTokenStore.setForProject(
+                    this,
+                    url,
+                    selected <= 0 ? null : tokens.get(selected - 1).id
+                );
+                dialog.dismiss();
+                showProjectSwitcher();
+            }));
+        dialog.show();
+    }
+
+    private TextView formLabel(String text) {
+        TextView label = new TextView(this);
+        label.setText(text);
+        label.setTextSize(12);
+        label.setTextColor(Color.rgb(110, 110, 115));
+        label.setPadding(dp(4), dp(10), 0, 0);
+        return label;
+    }
+
+    /**
+     * A readable default name: the folder or workspace code-server opens
+     * (?folder=/path, ?workspace=/path.code-workspace), else the host.
+     */
+    private static String suggestedProjectName(String url) {
+        if (RdpConnectionPanel.isRdpAddress(url)) {
+            return RdpConnectionPanel.hostOf(url);
+        }
+        Uri uri = Uri.parse(url);
+        for (String parameter : new String[] { "folder", "workspace" }) {
+            String path = null;
+            try {
+                path = uri.getQueryParameter(parameter);
+            } catch (UnsupportedOperationException ignored) {
+                // Not a hierarchical URI.
+            }
+            if (path != null && !path.isEmpty()) {
+                String trimmed = path.replaceAll("/+$", "");
+                String base = trimmed.substring(trimmed.lastIndexOf('/') + 1)
+                    .replaceAll("\\.code-workspace$", "");
+                if (!base.isEmpty()) {
+                    return base;
+                }
+            }
+        }
+        String host = uri.getHost();
+        return host == null || host.isEmpty() ? url : host;
+    }
+
+    private static boolean sameSite(String openerUrl, Uri target) {
+        if (openerUrl == null || target == null || target.getHost() == null) {
+            return false;
+        }
+        Uri opener = Uri.parse(openerUrl);
+        return target.getHost().equalsIgnoreCase(opener.getHost())
+            && String.valueOf(target.getScheme()).equalsIgnoreCase(String.valueOf(opener.getScheme()))
+            && target.getPort() == opener.getPort();
+    }
+
+    /** Opens a same-site new window as a project session and offers to save it. */
+    private void openNewWindowAsProject(String url) {
+        String normalized = normalizeAddress(url);
+        if (normalized.isEmpty()) {
+            return;
+        }
+        boolean alreadyOpen = findProjectSession(normalized) != null;
+        switchToProjectUrl(normalized);
+        for (ProjectProfile project : projects) {
+            if (addressesEquivalent(project.url, normalized)) {
+                if (alreadyOpen) {
+                    Toast.makeText(this, project.name + " is already open", Toast.LENGTH_SHORT).show();
+                }
+                return;
+            }
+        }
+        new AlertDialog.Builder(this)
+            .setTitle(boldText("New window"))
+            .setMessage("Opened as a new session: " + suggestedProjectName(normalized)
+                + "\nSave it as a project?")
+            .setPositiveButton("Save…", (dialog, which) -> showProjectEditor(-1, normalized))
+            .setNegativeButton("Not now", null)
             .show();
     }
 
     private void openProject(ProjectProfile project) {
         switchToProjectUrl(project.url);
-    }
-
-    private void showProjectManager() {
-        if (projects.isEmpty()) {
-            Toast.makeText(this, "No saved projects", Toast.LENGTH_SHORT).show();
-            return;
-        }
-
-        long now = SystemClock.elapsedRealtime();
-        cleanupExpiredProjectSessions(now);
-        CharSequence[] labels = new CharSequence[projects.size()];
-        for (int index = 0; index < projects.size(); index++) {
-            ProjectProfile project = projects.get(index);
-            labels[index] = styledProjectLabel(
-                project,
-                true,
-                isProjectSessionHot(project.url, now)
-            );
-        }
-
-        new AlertDialog.Builder(this)
-            .setTitle(boldText("Tap a project to delete"))
-            .setItems(labels, (dialog, which) -> confirmProjectDeletion(which))
-            .setNegativeButton("Done", null)
-            .show();
     }
 
     private void confirmProjectDeletion(int index) {
@@ -3120,6 +4250,7 @@ public final class MainActivity extends Activity {
             .setPositiveButton("Delete", (dialog, which) -> {
                 projects.remove(index);
                 persistProjects();
+                showProjectSwitcher();
             })
             .setNegativeButton("Cancel", null)
             .show();
@@ -3131,24 +4262,6 @@ public final class MainActivity extends Activity {
             new StyleSpan(Typeface.BOLD),
             0,
             text.length(),
-            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-        );
-        return styled;
-    }
-
-    private static CharSequence styledProjectLabel(
-        ProjectProfile project,
-        boolean includeUrl,
-        boolean hot
-    ) {
-        String suffix = (RdpConnectionPanel.isRdpAddress(project.url) ? "  • RDP" : "")
-            + (hot ? "  • HOT" : "");
-        String text = project.name + suffix + (includeUrl ? "\n" + project.url : "");
-        SpannableString styled = new SpannableString(text);
-        styled.setSpan(
-            new StyleSpan(Typeface.BOLD),
-            0,
-            project.name.length(),
             Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
         );
         return styled;
@@ -3290,7 +4403,8 @@ public final class MainActivity extends Activity {
             return;
         }
         mouseModeEnabled = enabled;
-        preferences.edit().putBoolean(MOUSE_MODE_KEY, enabled).apply();
+        preferences.edit().putBoolean(projectStateKey(MOUSE_MODE_KEY, activeSessionKey), enabled)
+            .apply();
         applyMouseMode();
         Toast.makeText(
             this,
@@ -3335,12 +4449,15 @@ public final class MainActivity extends Activity {
             ? target.getWidth()
             : (webContainer == null ? 0 : webContainer.getWidth());
         float widthDp = widthPx / getResources().getDisplayMetrics().density;
+        int lock = target == webView ? keyboardLock : keyboardLockFor(sessionKeyOf(target));
         String script = String.format(
             Locale.US,
             "window.__codeServerAppKeyboard"
                 + " && typeof window.__codeServerAppKeyboard.setMouseMode === 'function'"
-                + " ? window.__codeServerAppKeyboard.setMouseMode(%b, %.2f) : false",
-            mouseModeEnabled,
+                + " ? (window.__codeServerAppKeyboard.setKeyboardLocked?.(%b),"
+                + " window.__codeServerAppKeyboard.setMouseMode(%b, %.2f)) : false",
+            lock == KEYBOARD_LOCKED_HIDDEN,
+            target == webView ? mouseModeEnabled : mouseModeFor(sessionKeyOf(target)),
             widthDp
         );
         target.evaluateJavascript(script, null);
@@ -3423,14 +4540,30 @@ public final class MainActivity extends Activity {
         row.addView(button, keyLayoutParams(width));
     }
 
+    /** A flat icon button for the address bar. */
     private Button createToolbarButton(String label) {
         Button button = new Button(this);
         button.setText(label);
-        button.setTextSize(13);
+        button.setTextSize(17);
+        button.setTextColor(Color.rgb(40, 40, 40));
         button.setAllCaps(false);
-        button.setMinWidth(0);
-        button.setMinimumWidth(0);
-        button.setPadding(dp(10), 0, dp(10), 0);
+        button.setMinWidth(dp(36));
+        button.setMinimumWidth(dp(36));
+        button.setMinHeight(0);
+        button.setMinimumHeight(0);
+        button.setPadding(dp(6), 0, dp(6), 0);
+        button.setStateListAnimator(null);
+        GradientDrawable shape = new GradientDrawable();
+        shape.setColor(Color.TRANSPARENT);
+        shape.setCornerRadius(dp(8));
+        GradientDrawable mask = new GradientDrawable();
+        mask.setColor(Color.WHITE);
+        mask.setCornerRadius(dp(8));
+        button.setBackground(new RippleDrawable(
+            ColorStateList.valueOf(Color.argb(40, 0, 0, 0)),
+            shape,
+            mask
+        ));
         return button;
     }
 
@@ -3503,6 +4636,11 @@ public final class MainActivity extends Activity {
         if (!keepAliveEnabled) {
             boolean activeViewIsCached = activeSessionKey != null;
             for (ProjectSession session : projectSessions.values()) {
+                // Remote desktops keep running in the background (see
+                // applyKeepAliveMode); pausing them would drop the session.
+                if (rdpWebViews.contains(session.webView)) {
+                    continue;
+                }
                 session.webView.onPause();
             }
             if (!activeViewIsCached && webView != null) {
@@ -3580,8 +4718,30 @@ public final class MainActivity extends Activity {
         void setImeVisible(boolean visible) {
             boolean wasVisible = imeVisible;
             imeVisible = visible;
-            if (wasVisible && !visible && forcedImeEnabled) {
+            // A keyboard locked open is brought back right away, so keep the
+            // forced input connection (and with it the remote desktop typing).
+            if (wasVisible && !visible && forcedImeEnabled
+                && keyboardLock != KEYBOARD_LOCKED_OPEN) {
                 disableForcedIme();
+            }
+        }
+
+        boolean isForcedImeEnabled() {
+            return forcedImeEnabled || isBuiltInRemoteDesktop();
+        }
+
+        private boolean isBuiltInRemoteDesktop() {
+            return rdpWebViews.contains(this);
+        }
+
+        /** Shows the keyboard again on the existing forced input connection. */
+        void reshowForcedIme() {
+            forcedImeRequestedAt = SystemClock.elapsedRealtime();
+            requestFocus();
+            InputMethodManager inputMethodManager =
+                (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (inputMethodManager != null) {
+                inputMethodManager.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT);
             }
         }
 
@@ -3618,9 +4778,77 @@ public final class MainActivity extends Activity {
             }
         }
 
+        /**
+         * A keyboard locked open on the built-in remote desktop must not be
+         * closed by the page: Chromium hides it whenever a tap lands on the
+         * (non-editable) IronRDP canvas, and bringing it back flashes.
+         */
+        private boolean holdingKeyboard() {
+            return keyboardLock == KEYBOARD_LOCKED_OPEN && isBuiltInRemoteDesktop();
+        }
+
+        /**
+         * InputMethodManager.hideSoftInputFromWindow only hides when the
+         * focused view's window token matches the one given. While the
+         * keyboard is held, that one check gets no token, so Chromium's hide
+         * request is ignored. Every other caller gets the real token.
+         */
+        @Override
+        public IBinder getWindowToken() {
+            IBinder token = super.getWindowToken();
+            if (token != null && holdingKeyboard() && calledFromImeHide()) {
+                return null;
+            }
+            return token;
+        }
+
+        private boolean calledFromImeHide() {
+            for (StackTraceElement frame : new Throwable().getStackTrace()) {
+                if ("hideSoftInputFromWindow".equals(frame.getMethodName())
+                    && frame.getClassName().startsWith("android.view.inputmethod.InputMethodManager")) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /** Newer Chromium hides the keyboard through the insets controller. */
+        @Override
+        public WindowInsetsController getWindowInsetsController() {
+            WindowInsetsController controller = super.getWindowInsetsController();
+            if (controller == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+                return controller;
+            }
+            return (WindowInsetsController) java.lang.reflect.Proxy.newProxyInstance(
+                WindowInsetsController.class.getClassLoader(),
+                new Class<?>[] { WindowInsetsController.class },
+                (proxy, method, args) -> {
+                    if ("hide".equals(method.getName())
+                        && args != null && args.length == 1
+                        && args[0] instanceof Integer
+                        && (((Integer) args[0]) & WindowInsets.Type.ime()) != 0
+                        && holdingKeyboard()) {
+                        int others = ((Integer) args[0]) & ~WindowInsets.Type.ime();
+                        if (others != 0) {
+                            controller.hide(others);
+                        }
+                        return null;
+                    }
+                    try {
+                        return method.invoke(controller, args);
+                    } catch (java.lang.reflect.InvocationTargetException exception) {
+                        throw exception.getCause();
+                    }
+                }
+            );
+        }
+
         @Override
         public boolean onCheckIsTextEditor() {
-            if (forcedImeEnabled) {
+            if (keyboardLock == KEYBOARD_LOCKED_HIDDEN) {
+                return false;
+            }
+            if (forcedImeEnabled || isBuiltInRemoteDesktop()) {
                 return true;
             }
             // Mouse mode never lets page focus changes raise the system keyboard.
@@ -3629,7 +4857,14 @@ public final class MainActivity extends Activity {
 
         @Override
         public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
-            if (!forcedImeEnabled) {
+            if (keyboardLock == KEYBOARD_LOCKED_HIDDEN) {
+                return null;
+            }
+            if (isBuiltInRemoteDesktop()) {
+                // The page has nothing else to type into: whichever way the
+                // keyboard came up, its input goes to the remote desktop.
+                ironRdpMode = true;
+            } else if (!forcedImeEnabled) {
                 return mouseModeEnabled ? null : super.onCreateInputConnection(outAttrs);
             }
             outAttrs.inputType = InputType.TYPE_CLASS_TEXT
@@ -3647,6 +4882,7 @@ public final class MainActivity extends Activity {
             if (event.getActionMasked() == MotionEvent.ACTION_DOWN
                 && forcedImeEnabled
                 && !imeVisible
+                && keyboardLock != KEYBOARD_LOCKED_OPEN
                 && SystemClock.elapsedRealtime() - forcedImeRequestedAt > 500L) {
                 disableForcedIme();
             }
@@ -3935,7 +5171,17 @@ public final class MainActivity extends Activity {
                 boolean barHidden = addressBar != null
                     && addressBar.getVisibility() != View.VISIBLE;
                 float contentY = event.getY() - getPaddingTop();
-                if (barHidden && contentY >= 0f && contentY <= dp(40)) {
+                // Fullscreen: a pull from the top edge brings the address bar back.
+                // Otherwise a pull down on the address bar shows the zoom slider.
+                boolean fromTopEdge = fullscreenEnabled
+                    && barHidden
+                    && contentY >= 0f
+                    && contentY <= dp(40);
+                boolean fromAddressBar = !fullscreenEnabled
+                    && addressBar != null
+                    && addressBar.getVisibility() == View.VISIBLE
+                    && event.getY() <= addressBar.getBottom();
+                if (fromTopEdge || fromAddressBar) {
                     edgePullStartX = event.getX();
                     edgePullStartY = event.getY();
                     trackingEdgePull = true;
@@ -3958,11 +5204,13 @@ public final class MainActivity extends Activity {
                     super.dispatchTouchEvent(cancel);
                     cancel.recycle();
                     showAddressBarTemporarily();
-                    // The same edge swipe also brought up the transient system bars;
-                    // put them away so the first swipe belongs to the app. Once the
-                    // address bar shows, a further swipe keeps them.
-                    hideSystemBars();
-                    postDelayed(MainActivity.this::hideSystemBars, 250L);
+                    if (fullscreenEnabled) {
+                        // The same edge swipe also brought up the transient system
+                        // bars; put them away so the first swipe belongs to the app.
+                        // Once the address bar shows, a further swipe keeps them.
+                        hideSystemBars();
+                        postDelayed(MainActivity.this::hideSystemBars, 250L);
+                    }
                     return true;
                 }
                 if (dy < -dp(8) || dx > dp(48)) {

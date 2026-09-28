@@ -145,7 +145,7 @@ private let keyboardBridgeSource = #"""
   window.__codeServerAppIsRdpPage = () => Boolean(findIronRdpCanvas());
 
   const existingBridge = window.__codeServerAppKeyboard;
-  if (existingBridge && existingBridge.version >= 12) {
+  if (existingBridge && existingBridge.version >= 17) {
     window.__codeServerAppForceKeyboard = () => existingBridge.forceKeyboard();
     existingBridge.installRdpGestures?.();
     existingBridge.installDesktopGestures?.();
@@ -244,7 +244,45 @@ private let keyboardBridgeSource = #"""
       event.stopImmediatePropagation();
     }, true);
 
+    // Two-finger swipes scroll like a mouse wheel at the fingers' midpoint.
+    // Pixel deltas, doubled so a swipe covers a comfortable distance.
+    const WHEEL_GAIN = 2;
+    let wheel = null;
+    const midpoint = (touches) => {
+      const first = pointFromTouch(touches[0]);
+      const second = pointFromTouch(touches[1]);
+      return {
+        clientX: (first.clientX + second.clientX) / 2,
+        clientY: (first.clientY + second.clientY) / 2,
+        screenX: (first.screenX + second.screenX) / 2,
+        screenY: (first.screenY + second.screenY) / 2
+      };
+    };
+    const dispatchWheel = (point, deltaX, deltaY) => {
+      const eventWindow = canvas.ownerDocument?.defaultView || window;
+      canvas.dispatchEvent(new eventWindow.WheelEvent('wheel', {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view: eventWindow,
+        clientX: point.clientX,
+        clientY: point.clientY,
+        screenX: point.screenX,
+        screenY: point.screenY,
+        deltaX,
+        deltaY,
+        deltaMode: 0
+      }));
+    };
+
     canvas.addEventListener('touchstart', (event) => {
+      if (event.touches.length === 2 && !gesture?.dragging) {
+        releaseGesture();
+        gesture = null;
+        wheel = { last: midpoint(event.touches) };
+        dispatchMouse(canvas, 'mousemove', wheel.last, 0, 0);
+        return;
+      }
       if (event.touches.length !== 1) return;
       const start = pointFromTouch(event.touches[0]);
       gesture = {
@@ -260,6 +298,22 @@ private let keyboardBridgeSource = #"""
     }, { capture: true, passive: true });
 
     canvas.addEventListener('touchmove', (event) => {
+      if (wheel && event.touches.length === 2) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        const point = midpoint(event.touches);
+        const dx = point.clientX - wheel.last.clientX;
+        const dy = point.clientY - wheel.last.clientY;
+        if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) return;
+        wheel.last = point;
+        // IronRDP scrolls one axis per event: send the dominant one.
+        if (Math.abs(dy) >= Math.abs(dx)) {
+          dispatchWheel(point, 0, -dy * WHEEL_GAIN);
+        } else {
+          dispatchWheel(point, -dx * WHEEL_GAIN, 0);
+        }
+        return;
+      }
       if (!gesture || event.touches.length !== 1) return;
       const point = pointFromTouch(event.touches[0]);
       gesture.last = point;
@@ -289,6 +343,7 @@ private let keyboardBridgeSource = #"""
     }, { capture: true, passive: false });
 
     const finishGesture = (event, cancelled) => {
+      if (wheel && event.touches.length < 2) wheel = null;
       if (!gesture) return;
       releaseGesture();
       const touch = event.changedTouches?.[0];
@@ -364,7 +419,24 @@ private let keyboardBridgeSource = #"""
       event.stopImmediatePropagation();
     }, true);
 
+    // Two-finger swipes scroll like a mouse wheel (pages and Monaco alike),
+    // following the midpoint of the fingers. They replace pinch zoom; the
+    // app's zoom slider sets the page zoom.
+    let wheel = null;
+    const touchMidpoint = (touches) => ({
+      clientX: (touches[0].clientX + touches[1].clientX) / 2,
+      clientY: (touches[0].clientY + touches[1].clientY) / 2
+    });
+
     document.addEventListener('touchstart', (event) => {
+      if (event.touches.length === 2
+          && !isIronRdpEvent(event)
+          && !gesture?.dragging) {
+        clearTimer(gesture);
+        gesture = null;
+        wheel = { last: touchMidpoint(event.touches) };
+        return;
+      }
       if (event.touches.length !== 1 || isIronRdpEvent(event)) return;
       const path = eventPath(event);
       const startTarget = path.find((target) => target?.dispatchEvent)
@@ -386,6 +458,17 @@ private let keyboardBridgeSource = #"""
     }, { capture: true, passive: true });
 
     document.addEventListener('touchmove', (event) => {
+      if (wheel && event.touches.length === 2) {
+        if (event.cancelable) event.preventDefault();
+        event.stopImmediatePropagation();
+        const point = touchMidpoint(event.touches);
+        const dx = wheel.last.clientX - point.clientX;
+        const dy = wheel.last.clientY - point.clientY;
+        if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) return;
+        wheel.last = point;
+        mouseWheel(point.clientX, point.clientY, dx, dy);
+        return;
+      }
       if (!gesture || event.touches.length !== 1) return;
       const point = pointFromTouch(event.touches[0]);
       gesture.last = point;
@@ -415,6 +498,7 @@ private let keyboardBridgeSource = #"""
     }, { capture: true, passive: false });
 
     const finishGesture = (event, cancelled) => {
+      if (wheel && event.touches.length < 2) wheel = null;
       if (!gesture) return;
       const activeGesture = gesture;
       gesture = null;
@@ -514,9 +598,28 @@ private let keyboardBridgeSource = #"""
     if (!isGeneric || !state.target) state.target = candidate;
   };
 
+  // IronRDP only takes keys while its canvas has focus; a tap elsewhere
+  // (e.g. a file bar button) moves it away, so restore it before typing.
+  const focusedIronRdpCanvas = (canvas) => {
+    const host = canvas.getRootNode?.()?.host;
+    if (host && document.activeElement !== host) {
+      canvas.focus({ preventScroll: true });
+    }
+    return canvas;
+  };
+
   const activeTarget = () => {
     if (state.ironRdpCanvas && state.ironRdpCanvas.isConnected) {
-      return state.ironRdpCanvas;
+      return focusedIronRdpCanvas(state.ironRdpCanvas);
+    }
+    // On the built-in remote desktop page all typing belongs to the
+    // remote desktop, even before KB was pressed.
+    if (window.__yourWorkspaceRdpPage) {
+      const canvas = findIronRdpCanvas();
+      if (canvas) {
+        state.ironRdpCanvas = canvas;
+        return focusedIronRdpCanvas(canvas);
+      }
     }
     const current = deepestActiveElement(document);
     if (current) {
@@ -761,17 +864,19 @@ private let keyboardBridgeSource = #"""
     cursor: null,
     left: null,
     right: null,
-    lockButton: null,
     touches: new Map(),
     cursorX: -1,
     cursorY: -1,
-    leftHeld: false,
-    leftLocked: false,
-    leftLockArmed: false,
-    leftMoved: false,
-    leftUnlockPending: false,
-    lockTimer: 0,
-    rightHeld: false,
+    // Per mouse button (0 left, 2 right): held down, locked down after
+    // a 1 s press, armed (lock reached, finger still on the button),
+    // released by the next tap (unlockPending), moved while held.
+    buttons: {
+      0: { held: false, locked: false, armed: false, unlockPending: false, moved: false, timer: 0 },
+      2: { held: false, locked: false, armed: false, unlockPending: false, moved: false, timer: 0 }
+    },
+    // Set by the app's keyboard lock ("locked hidden"): like mouse mode,
+    // editable elements get inputmode=none so the keyboard never opens.
+    keyboardLocked: false,
     inputModes: new Map()
   };
 
@@ -939,8 +1044,10 @@ private let keyboardBridgeSource = #"""
 
   // inputmode="none" keeps the system keyboard hidden while the element
   // still takes focus and receives forwarded keys.
+  const keyboardBlocked = () => mouseMode.enabled || mouseMode.keyboardLocked;
+
   const suppressKeyboardFor = (element) => {
-    if (!mouseMode.enabled || !isEditableElement(element)) return;
+    if (!keyboardBlocked() || !isEditableElement(element)) return;
     if (!mouseMode.inputModes.has(element)) {
       mouseMode.inputModes.set(element, element.getAttribute('inputmode'));
     }
@@ -950,7 +1057,7 @@ private let keyboardBridgeSource = #"""
   };
 
   const suppressKeyboardInDocument = () => {
-    if (!mouseMode.enabled) return;
+    if (!keyboardBlocked()) return;
     for (const element of document.querySelectorAll(
       'textarea, input, [contenteditable]'
     )) {
@@ -1138,27 +1245,37 @@ private let keyboardBridgeSource = #"""
       .button {
         position: absolute; box-sizing: border-box; border-radius: 50%;
         display: flex; align-items: center; justify-content: center;
-        font-family: system-ui, sans-serif; font-weight: 700; color: #fff;
-        background: rgba(0, 0, 0, 0.31); border: 2px solid rgba(255, 255, 255, 0.6);
-        pointer-events: auto; touch-action: none;
+        font-family: system-ui, sans-serif; font-weight: 600; color: #fff;
+        background: rgba(20, 20, 24, 0.42);
+        box-shadow: 0 1px 6px rgba(0, 0, 0, 0.35);
+        pointer-events: none; touch-action: none;
         user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+        transition: background-color 120ms;
       }
-      .button.pressed { background: rgba(103, 80, 164, 0.67); }
-      .button.locked { background: rgba(103, 80, 164, 0.86); border-color: #fff; }
-      .button.lock { font-weight: 400; }
+      .button.pressed { background: rgba(103, 80, 164, 0.62); }
+      .button.locked { background: rgba(103, 80, 164, 0.88); }
+      /* The outline doubles as the hold-to-lock progress ring. */
+      .ring { position: absolute; inset: 0; width: 100%; height: 100%;
+        transform: rotate(-90deg); overflow: visible; }
+      .ring circle { fill: none; stroke-width: 2.4; }
+      .ring .track { stroke: rgba(255, 255, 255, 0.55); }
+      .ring .bar { stroke: #d0bcff; stroke-linecap: round;
+        stroke-dasharray: 100.53; stroke-dashoffset: 100.53; }
+      .button.charging .ring .bar { stroke-dashoffset: 0;
+        transition: stroke-dashoffset 1000ms linear; }
+      .button.locked .ring .bar { stroke: #fff; stroke-dashoffset: 0; }
+      .label { position: relative; line-height: 1; }
     </style>
     <svg class="cursor" viewBox="0 0 14 22">
       <path d="M0.7 0.7 L0.7 18.5 L5.2 14.3 L8.3 21 L11.3 19.7 L8.2 13.1 L13.7 13.1 Z"
         fill="#fff" stroke="#000" stroke-width="1.4" stroke-linejoin="round"/>
     </svg>
-    <div class="button left">L</div>
-    <div class="button right">R</div>
-    <div class="button lock" title="Hold the left button">🔓</div>`;
+    <div class="button left"><svg class="ring" viewBox="0 0 36 36"><circle class="track" cx="18" cy="18" r="16"/><circle class="bar" cx="18" cy="18" r="16"/></svg><span class="label">L</span></div>
+    <div class="button right"><svg class="ring" viewBox="0 0 36 36"><circle class="track" cx="18" cy="18" r="16"/><circle class="bar" cx="18" cy="18" r="16"/></svg><span class="label">R</span></div>`;
     mouseMode.host = host;
     mouseMode.cursor = root.querySelector('.cursor');
     mouseMode.left = root.querySelector('.left');
     mouseMode.right = root.querySelector('.right');
-    mouseMode.lockButton = root.querySelector('.lock');
     document.documentElement.appendChild(host);
   };
 
@@ -1172,16 +1289,12 @@ private let keyboardBridgeSource = #"""
 
   const updateMouseButtons = () => {
     if (!mouseMode.left) return;
-    const leftLocked = mouseMode.leftLocked || mouseMode.leftLockArmed;
-    mouseMode.left.classList.toggle(
-      'pressed',
-      mouseMode.leftHeld || mouseMode.leftUnlockPending
-    );
-    mouseMode.left.classList.toggle('locked', leftLocked);
-    mouseMode.left.textContent = leftLocked ? 'L🔒' : 'L';
-    mouseMode.right.classList.toggle('pressed', mouseMode.rightHeld);
-    mouseMode.lockButton.classList.toggle('locked', mouseMode.leftLocked);
-    mouseMode.lockButton.textContent = mouseMode.leftLocked ? '🔒' : '🔓';
+    for (const [button, element] of [[0, mouseMode.left], [2, mouseMode.right]]) {
+      const state = mouseMode.buttons[button];
+      element.classList.toggle('pressed', state.held || state.unlockPending);
+      element.classList.toggle('locked', state.locked || state.armed);
+      element.classList.toggle('charging', Boolean(state.timer));
+    }
   };
 
   const layoutMouseOverlay = () => {
@@ -1206,10 +1319,9 @@ private let keyboardBridgeSource = #"""
       fontSize: `${18 * scale}px`,
       borderWidth: `${2 * scale}px`
     });
-    place(mouseMode.left, 68, 84, 40);
-    place(mouseMode.right, 56, 16, 16);
-    place(mouseMode.lockButton, 42, 97, 120);
-    mouseMode.lockButton.style.fontSize = `${16 * scale}px`;
+    // Side by side like a mouse, L on the left, near the right edge.
+    place(mouseMode.left, 60, 88, 28);
+    place(mouseMode.right, 60, 18, 28);
     if (mouseMode.cursorX < 0) {
       mouseMode.cursorX = rect.left + rect.width / 2;
       mouseMode.cursorY = rect.top + rect.height / 2;
@@ -1223,103 +1335,88 @@ private let keyboardBridgeSource = #"""
     y = Math.min(Math.max(y, rect.top), rect.top + rect.height - 1);
     mouseMode.cursorX = x;
     mouseMode.cursorY = y;
-    if (mouseMode.leftHeld) mouseMode.leftMoved = true;
+    for (const state of Object.values(mouseMode.buttons)) {
+      if (!state.held) continue;
+      state.moved = true;
+      // Dragging with the button held: no lock, so stop the ring.
+      if (state.timer) {
+        window.clearTimeout(state.timer);
+        state.timer = 0;
+        updateMouseButtons();
+      }
+    }
     updateMouseCursor();
     mouseAction('move', x, y);
   };
 
-  const clearLeftLockTimer = () => {
-    if (mouseMode.lockTimer) window.clearTimeout(mouseMode.lockTimer);
-    mouseMode.lockTimer = 0;
+  // Holding L or R for 1 s (without moving the cursor) locks it down,
+  // shown by the ring around the button filling up; the next tap on
+  // that button releases it.
+  const BUTTON_LOCK_MS = 1000;
+
+  const clearButtonLockTimer = (state) => {
+    if (state.timer) window.clearTimeout(state.timer);
+    state.timer = 0;
   };
 
-  const mouseLeftDown = () => {
-    if (mouseMode.leftLocked) {
-      // Tap while drag-locked: release the button when this tap ends.
-      mouseMode.leftLocked = false;
-      mouseMode.leftUnlockPending = true;
+  const mouseButtonDown = (button) => {
+    const state = mouseMode.buttons[button];
+    if (state.locked) {
+      // Tap while locked: release the button when this tap ends.
+      state.locked = false;
+      state.unlockPending = true;
       updateMouseButtons();
       return;
     }
-    mouseMode.leftHeld = true;
-    mouseMode.leftLockArmed = false;
-    mouseMode.leftMoved = false;
-    mouseAction('down', mouseMode.cursorX, mouseMode.cursorY, 0);
-    clearLeftLockTimer();
-    mouseMode.lockTimer = window.setTimeout(() => {
-      mouseMode.lockTimer = 0;
-      if (!mouseMode.leftHeld || mouseMode.leftMoved) return;
-      mouseMode.leftLockArmed = true;
-      navigator.vibrate?.(15);
+    state.held = true;
+    state.armed = false;
+    state.moved = false;
+    mouseAction('down', mouseMode.cursorX, mouseMode.cursorY, button);
+    clearButtonLockTimer(state);
+    state.timer = window.setTimeout(() => {
+      state.timer = 0;
+      if (state.held && !state.moved) {
+        state.armed = true;
+        navigator.vibrate?.(20);
+      }
       updateMouseButtons();
-    }, 500);
+    }, BUTTON_LOCK_MS);
     updateMouseButtons();
   };
 
-  const mouseLeftUp = (cancelled) => {
-    clearLeftLockTimer();
-    if (mouseMode.leftUnlockPending) {
-      mouseMode.leftUnlockPending = false;
-      mouseMode.leftHeld = false;
-      mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 0);
+  const mouseButtonUp = (button, cancelled) => {
+    const state = mouseMode.buttons[button];
+    clearButtonLockTimer(state);
+    if (state.unlockPending) {
+      state.unlockPending = false;
+      state.held = false;
+      mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, button);
       updateMouseButtons();
       return;
     }
-    if (mouseMode.leftLocked) {
-      // Locked with the lock button while L was pressed: keep holding.
+    if (!state.held) return;
+    if (!cancelled && state.armed && !state.moved) {
+      state.armed = false;
+      state.locked = true;
       updateMouseButtons();
       return;
     }
-    if (!mouseMode.leftHeld) return;
-    if (!cancelled && mouseMode.leftLockArmed && !mouseMode.leftMoved) {
-      // Long press without movement: keep the button down for one-finger drags.
-      mouseMode.leftLockArmed = false;
-      mouseMode.leftLocked = true;
-      updateMouseButtons();
-      return;
-    }
-    mouseMode.leftHeld = false;
-    mouseMode.leftLockArmed = false;
-    mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 0);
-    updateMouseButtons();
-  };
-
-  // The lock button holds the left button down (for drags and selections)
-  // until it, or L, is tapped again.
-  const toggleLeftLock = () => {
-    clearLeftLockTimer();
-    mouseMode.leftLockArmed = false;
-    mouseMode.leftUnlockPending = false;
-    if (mouseMode.leftLocked) {
-      mouseMode.leftLocked = false;
-      if (mouseMode.leftHeld) {
-        mouseMode.leftHeld = false;
-        mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 0);
-      }
-    } else {
-      mouseMode.leftLocked = true;
-      if (!mouseMode.leftHeld) {
-        mouseMode.leftHeld = true;
-        mouseMode.leftMoved = false;
-        mouseAction('down', mouseMode.cursorX, mouseMode.cursorY, 0);
-      }
-    }
-    navigator.vibrate?.(15);
+    state.held = false;
+    state.armed = false;
+    mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, button);
     updateMouseButtons();
   };
 
   const releaseMouseButtons = () => {
-    clearLeftLockTimer();
     for (const held of [0, 2, 1]) {
       if (mouse.buttons & mouseButtonMask(held)) {
         mouseAction('up', mouse.lastX, mouse.lastY, held);
       }
     }
-    mouseMode.leftHeld = false;
-    mouseMode.leftLocked = false;
-    mouseMode.leftLockArmed = false;
-    mouseMode.leftUnlockPending = false;
-    mouseMode.rightHeld = false;
+    for (const state of Object.values(mouseMode.buttons)) {
+      clearButtonLockTimer(state);
+      Object.assign(state, { held: false, locked: false, armed: false, unlockPending: false });
+    }
     mouseMode.touches.clear();
     updateMouseButtons();
   };
@@ -1330,8 +1427,27 @@ private let keyboardBridgeSource = #"""
     return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
   };
 
+  // Controls the page marks as app UI (e.g. the remote desktop's file
+  // bars) keep normal touch behaviour in mouse mode.
+  const appUiTouchIds = new Set();
+  const isAppUiEvent = (event) => {
+    const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+    return path.some((node) => node?.hasAttribute?.('data-your-workspace-ui'));
+  };
+
   const handleMouseModeTouch = (event) => {
     if (!mouseMode.enabled) return;
+    const changed = Array.from(event.changedTouches || []);
+    if (event.type === 'touchstart' && isAppUiEvent(event)) {
+      for (const touch of changed) appUiTouchIds.add(touch.identifier);
+      return;
+    }
+    if (changed.length && changed.every((touch) => appUiTouchIds.has(touch.identifier))) {
+      if (event.type === 'touchend' || event.type === 'touchcancel') {
+        for (const touch of changed) appUiTouchIds.delete(touch.identifier);
+      }
+      return;
+    }
     if (event.cancelable) event.preventDefault();
     event.stopImmediatePropagation();
     const type = event.type;
@@ -1343,9 +1459,7 @@ private let keyboardBridgeSource = #"""
         const pageTouches = Array.from(mouseMode.touches.values())
           .filter((info) => info.role === 'cursor' || info.role === 'anchor');
         let role = 'cursor';
-        if (pointInElement(mouseMode.lockButton, x, y)) {
-          role = 'lock';
-        } else if (pointInElement(mouseMode.left, x, y)) {
+        if (pointInElement(mouseMode.left, x, y)) {
           role = 'left';
         } else if (pointInElement(mouseMode.right, x, y)) {
           role = 'right';
@@ -1365,14 +1479,10 @@ private let keyboardBridgeSource = #"""
           startedAt: performance.now(),
           moved: false
         });
-        if (role === 'lock') {
-          toggleLeftLock();
-        } else if (role === 'left') {
-          mouseLeftDown();
+        if (role === 'left') {
+          mouseButtonDown(0);
         } else if (role === 'right') {
-          mouseMode.rightHeld = true;
-          mouseAction('down', mouseMode.cursorX, mouseMode.cursorY, 2);
-          updateMouseButtons();
+          mouseButtonDown(2);
         }
         continue;
       }
@@ -1402,13 +1512,9 @@ private let keyboardBridgeSource = #"""
       mouseMode.touches.delete(touch.identifier);
       const cancelled = type === 'touchcancel';
       if (info.role === 'left') {
-        mouseLeftUp(cancelled);
+        mouseButtonUp(0, cancelled);
       } else if (info.role === 'right') {
-        if (mouseMode.rightHeld) {
-          mouseMode.rightHeld = false;
-          mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 2);
-          updateMouseButtons();
-        }
+        mouseButtonUp(2, cancelled);
       } else if (info.role === 'cursor'
           && !cancelled
           && !info.moved
@@ -1424,7 +1530,7 @@ private let keyboardBridgeSource = #"""
   // Keep real touch-derived pointer and mouse events away from the page so
   // only the emulated mouse reaches it.
   const blockNativePointerEvents = (event) => {
-    if (!mouseMode.enabled || !event.isTrusted) return;
+    if (!mouseMode.enabled || !event.isTrusted || isAppUiEvent(event)) return;
     if (event.pointerType === 'mouse' || event.pointerType === 'pen') return;
     event.stopImmediatePropagation();
     if (event.cancelable) event.preventDefault();
@@ -1461,13 +1567,24 @@ private let keyboardBridgeSource = #"""
     } else {
       releaseMouseButtons();
       if (mouseMode.host) mouseMode.host.style.display = 'none';
+      if (!mouseMode.keyboardLocked) restoreKeyboardInputModes();
+    }
+    return true;
+  };
+
+  const setKeyboardLocked = (locked) => {
+    if (locked === mouseMode.keyboardLocked) return true;
+    mouseMode.keyboardLocked = locked;
+    if (locked) {
+      suppressKeyboardInDocument();
+    } else if (!mouseMode.enabled) {
       restoreKeyboardInputModes();
     }
     return true;
   };
 
   const bridge = {
-    version: 12,
+    version: 17,
     forceKeyboard() {
       installRdpGestures();
       const canvas = findIronRdpCanvas();
@@ -1493,6 +1610,9 @@ private let keyboardBridgeSource = #"""
     },
     setMouseMode(enabled, viewWidth) {
       return setMouseMode(Boolean(enabled), Number(viewWidth) || 0);
+    },
+    setKeyboardLocked(locked) {
+      return setKeyboardLocked(Boolean(locked));
     },
     setModifiers(control, shift) {
       const nextControl = Boolean(control);

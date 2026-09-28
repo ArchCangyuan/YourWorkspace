@@ -125,13 +125,13 @@ public final class RdpTunnelService extends Service {
                 PREFERRED_PORT,
                 PORT_ATTEMPTS,
                 () -> {
-                    // Read the token for every connection so a fresh sign-in
-                    // applies without restarting the tunnel.
-                    String token = AccessTokenStore.loadToken(appContext, host);
-                    if (token == null) {
+                    // Read the credential for every connection so a fresh sign-in
+                    // or token change applies without restarting the tunnel.
+                    AccessCredential credential = AccessTokenStore.credential(appContext, host);
+                    if (credential == null) {
                         throw new AccessWebSocket.LoginRequiredException("Sign-in required");
                     }
-                    return AccessWebSocket.connect(host, token);
+                    return AccessWebSocket.connect(host, credential);
                 },
                 new AccessTunnel.Listener() {
                     @Override
@@ -145,7 +145,9 @@ public final class RdpTunnelService extends Service {
 
                     @Override
                     public void onLoginRequired() {
-                        AccessTokenStore.clearToken(appContext, host);
+                        if (ServiceTokenStore.forProject(appContext, "rdp://" + host) == null) {
+                            AccessTokenStore.clearToken(appContext, host);
+                        }
                         loginRequired = true;
                         mainHandler.post(RdpTunnelService.this::updateNotification);
                         notifyStateChanged();

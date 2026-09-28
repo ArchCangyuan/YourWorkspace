@@ -22,7 +22,11 @@ import java.util.Base64;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLHandshakeException;
@@ -48,11 +52,17 @@ final class RdpGateway {
     interface Environment {
         InputStream openAsset(String name) throws IOException;
 
-        String loadToken(String host);
+        AccessCredential loadCredential(String host);
 
         void clearToken(String host);
 
-        AccessWebSocket openTunnel(String host, String token) throws IOException;
+        AccessWebSocket openTunnel(String host, AccessCredential credential) throws IOException;
+
+        /**
+         * Saves a file downloaded from the remote PC; returns where it went,
+         * for display (e.g. "Downloads/report.pdf").
+         */
+        String saveDownload(String name, InputStream content, long length) throws IOException;
     }
 
     private static final String ASSET_DIRECTORY = "rdp/";
@@ -64,8 +74,44 @@ final class RdpGateway {
     private final Map<String, String> sessionHosts = new ConcurrentHashMap<>();
     private final Map<String, String> sessionStages = new ConcurrentHashMap<>();
     private final Map<String, String> sessionErrors = new ConcurrentHashMap<>();
+    /** Why the last relay of a session ended (which side, and any error). */
+    private final Map<String, String> sessionRelayEnds = new ConcurrentHashMap<>();
+    /** The latest relay's trace per session, for the page's clipboard log. */
+    private final Map<String, RdpTrace> sessionTraces = new ConcurrentHashMap<>();
     private final java.util.Set<String> rsaKeyExchangeHosts = ConcurrentHashMap.newKeySet();
     private final SecureRandom random = new SecureRandom();
+    // Cloudflare closes idle WebSockets after about 100 s; an idle or
+    // backgrounded remote desktop sends nothing, so the tunnels are pinged.
+    private static final long TUNNEL_PING_SECONDS = 20L;
+    /** Largest WebSocket frame sent into the Cloudflare tunnel. */
+    private static final int TUNNEL_FRAME_BYTES = 4 * 1024;
+    private final Set<AccessWebSocket> openTunnels = ConcurrentHashMap.newKeySet();
+
+    /** Opens the content of a file picked on the device. */
+    interface UploadSource {
+        InputStream open() throws IOException;
+    }
+
+    private static final class StagedUpload {
+        final UploadSource source;
+        final long length;
+        final long stagedAt = System.currentTimeMillis();
+
+        StagedUpload(UploadSource source, long length) {
+            this.source = source;
+            this.length = length;
+        }
+    }
+
+    private static final long UPLOAD_TTL_MS = 10 * 60 * 1000L;
+    private final Map<String, StagedUpload> stagedUploads = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService pinger = Executors.newSingleThreadScheduledExecutor(
+        runnable -> {
+            Thread thread = new Thread(runnable, "RdpGateway-ping");
+            thread.setDaemon(true);
+            return thread;
+        }
+    );
     private volatile Listener listener;
 
     RdpGateway(Environment environment) throws IOException {
@@ -76,6 +122,15 @@ final class RdpGateway {
         Thread acceptThread = new Thread(this::acceptLoop, "RdpGateway-accept");
         acceptThread.setDaemon(true);
         acceptThread.start();
+        pinger.scheduleWithFixedDelay(() -> {
+            for (AccessWebSocket tunnel : openTunnels) {
+                try {
+                    tunnel.sendPing();
+                } catch (IOException ignored) {
+                    // The relay notices the broken tunnel and ends the session.
+                }
+            }
+        }, TUNNEL_PING_SECONDS, TUNNEL_PING_SECONDS, TimeUnit.SECONDS);
     }
 
     static synchronized RdpGateway get(Context context) throws IOException {
@@ -89,8 +144,8 @@ final class RdpGateway {
                 }
 
                 @Override
-                public String loadToken(String host) {
-                    return AccessTokenStore.loadToken(appContext, host);
+                public AccessCredential loadCredential(String host) {
+                    return AccessTokenStore.credential(appContext, host);
                 }
 
                 @Override
@@ -99,8 +154,15 @@ final class RdpGateway {
                 }
 
                 @Override
-                public AccessWebSocket openTunnel(String host, String token) throws IOException {
-                    return AccessWebSocket.connect(host, token);
+                public AccessWebSocket openTunnel(String host, AccessCredential credential)
+                    throws IOException {
+                    return AccessWebSocket.connect(host, credential);
+                }
+
+                @Override
+                public String saveDownload(String name, InputStream content, long length)
+                    throws IOException {
+                    return DownloadSaver.save(appContext, name, content, length);
                 }
             });
         }
@@ -109,6 +171,7 @@ final class RdpGateway {
 
     void close() {
         closeQuietly(server);
+        pinger.shutdownNow();
     }
 
     void setListener(Listener listener) {
@@ -132,6 +195,13 @@ final class RdpGateway {
         return token;
     }
 
+    void note(String sessionToken, String text) {
+        RdpTrace trace = sessionTraces.get(sessionToken);
+        if (trace != null && text != null) {
+            trace.note(text);
+        }
+    }
+
     /**
      * Describes the latest connection attempt of a session as JSON: the stage
      * it reached ({@code tunnel}, {@code negotiate}, {@code tls}, {@code relay})
@@ -142,6 +212,11 @@ final class RdpGateway {
         try {
             status.put("stage", sessionStages.getOrDefault(sessionToken, ""));
             status.put("error", sessionErrors.getOrDefault(sessionToken, ""));
+            status.put("relayEnd", sessionRelayEnds.getOrDefault(sessionToken, ""));
+            RdpTrace trace = sessionTraces.get(sessionToken);
+            status.put("clipboard", trace == null ? "" : trace.clipboardLog());
+            status.put("fileListWaitMs", trace == null ? 0 : trace.fileListWaitMs());
+            status.put("clipboardReady", trace != null && trace.clipboardReady());
         } catch (org.json.JSONException ignored) {
             // Fields are plain strings.
         }
@@ -164,6 +239,20 @@ final class RdpGateway {
         String message = exception.getMessage();
         String name = exception.getClass().getSimpleName();
         return message == null || message.isEmpty() ? name : name + ": " + message;
+    }
+
+    /**
+     * Stages a device file for the remote desktop page to fetch once, by the
+     * returned random id (valid for ten minutes, with a session token).
+     */
+    String stageUpload(UploadSource source, long length) {
+        long now = System.currentTimeMillis();
+        stagedUploads.values().removeIf(upload -> now - upload.stagedAt > UPLOAD_TTL_MS);
+        byte[] bytes = new byte[18];
+        random.nextBytes(bytes);
+        String id = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+        stagedUploads.put(id, new StagedUpload(source, length));
+        return id;
     }
 
     String pageUrl(String sessionToken) {
@@ -193,9 +282,11 @@ final class RdpGateway {
             InputStream input = new BufferedInputStream(client.getInputStream());
             String requestLine = readLine(input);
             String[] parts = requestLine.split(" ");
+            String method = parts.length >= 1 ? parts[0] : "";
             String path = parts.length >= 2 ? parts[1] : "/";
             String webSocketKey = null;
             boolean upgrade = false;
+            long contentLength = -1L;
             for (String line = readLine(input); !line.isEmpty(); line = readLine(input)) {
                 int colon = line.indexOf(':');
                 if (colon <= 0) {
@@ -203,7 +294,13 @@ final class RdpGateway {
                 }
                 String name = line.substring(0, colon).trim().toLowerCase(Locale.US);
                 String value = line.substring(colon + 1).trim();
-                if (name.equals("sec-websocket-key")) {
+                if (name.equals("content-length")) {
+                    try {
+                        contentLength = Long.parseLong(value);
+                    } catch (NumberFormatException ignored) {
+                        contentLength = -1L;
+                    }
+                } else if (name.equals("sec-websocket-key")) {
                     webSocketKey = value;
                 } else if (name.equals("upgrade") && value.equalsIgnoreCase("websocket")) {
                     upgrade = true;
@@ -212,6 +309,10 @@ final class RdpGateway {
             if (upgrade && webSocketKey != null && path.startsWith("/gw")) {
                 AccessWebSocket webSocket = AccessWebSocket.acceptServer(client, input, webSocketKey);
                 runCleanPathSession(webSocket);
+            } else if (method.equals("POST") && path.startsWith("/download?")) {
+                saveDownload(client, input, path, contentLength);
+            } else if (method.equals("GET") && path.startsWith("/upload?")) {
+                serveUpload(client, path);
             } else {
                 serveAsset(client, path);
             }
@@ -254,6 +355,138 @@ final class RdpGateway {
         closeQuietly(client);
     }
 
+    /**
+     * Saves a file the page downloaded from the remote PC. Only pages holding a
+     * session token may do this, since other apps can reach the loopback port.
+     */
+    private void saveDownload(Socket client, InputStream input, String path, long length)
+        throws IOException {
+        OutputStream output = client.getOutputStream();
+        Map<String, String> query = parseQuery(path.substring(path.indexOf('?') + 1));
+        String name = query.get("name");
+        if (!sessionHosts.containsKey(query.getOrDefault("t", ""))
+            || name == null || name.isEmpty() || length < 0) {
+            writeStatus(output, "403 Forbidden");
+            closeQuietly(client);
+            return;
+        }
+        client.setSoTimeout(60_000);
+        String savedAs;
+        try {
+            savedAs = environment.saveDownload(name, new BoundedInputStream(input, length), length);
+        } catch (IOException | RuntimeException exception) {
+            byte[] body = describe(exception).getBytes(StandardCharsets.UTF_8);
+            output.write(("HTTP/1.1 500 Internal Server Error\r\n"
+                + "Content-Type: text/plain; charset=utf-8\r\n"
+                + "Content-Length: " + body.length + "\r\n"
+                + "Connection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+            output.write(body);
+            output.flush();
+            closeQuietly(client);
+            return;
+        }
+        org.json.JSONObject result = new org.json.JSONObject();
+        try {
+            result.put("savedAs", savedAs);
+        } catch (org.json.JSONException ignored) {
+            // A plain string.
+        }
+        byte[] body = result.toString().getBytes(StandardCharsets.UTF_8);
+        output.write(("HTTP/1.1 200 OK\r\n"
+            + "Content-Type: application/json\r\n"
+            + "Content-Length: " + body.length + "\r\n"
+            + "Connection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+        output.write(body);
+        output.flush();
+        closeQuietly(client);
+    }
+
+    /** Streams a staged device file to the page, once. */
+    private void serveUpload(Socket client, String path) throws IOException {
+        OutputStream output = client.getOutputStream();
+        Map<String, String> query = parseQuery(path.substring(path.indexOf('?') + 1));
+        StagedUpload upload = sessionHosts.containsKey(query.getOrDefault("t", ""))
+            ? stagedUploads.remove(query.getOrDefault("id", ""))
+            : null;
+        if (upload == null) {
+            writeStatus(output, "404 Not Found");
+            closeQuietly(client);
+            return;
+        }
+        client.setSoTimeout(60_000);
+        try (InputStream content = upload.source.open()) {
+            String headers = "HTTP/1.1 200 OK\r\n"
+                + "Content-Type: application/octet-stream\r\n"
+                + (upload.length >= 0 ? "Content-Length: " + upload.length + "\r\n" : "")
+                + "Cache-Control: no-store\r\n"
+                + "Connection: close\r\n\r\n";
+            output.write(headers.getBytes(StandardCharsets.US_ASCII));
+            byte[] buffer = new byte[64 * 1024];
+            for (int count = content.read(buffer); count >= 0; count = content.read(buffer)) {
+                output.write(buffer, 0, count);
+            }
+            output.flush();
+        } catch (IOException | RuntimeException exception) {
+            // The page sees a truncated body or a closed connection.
+        } finally {
+            closeQuietly(client);
+        }
+    }
+
+    private static Map<String, String> parseQuery(String query) {
+        Map<String, String> values = new java.util.HashMap<>();
+        for (String pair : query.split("&")) {
+            int equals = pair.indexOf('=');
+            if (equals <= 0) {
+                continue;
+            }
+            try {
+                values.put(
+                    java.net.URLDecoder.decode(pair.substring(0, equals), "UTF-8"),
+                    java.net.URLDecoder.decode(pair.substring(equals + 1), "UTF-8")
+                );
+            } catch (java.io.UnsupportedEncodingException | IllegalArgumentException ignored) {
+                // Skip malformed pairs.
+            }
+        }
+        return values;
+    }
+
+    /** Reads at most {@code limit} bytes: the request body. */
+    private static final class BoundedInputStream extends InputStream {
+        private final InputStream input;
+        private long remaining;
+
+        BoundedInputStream(InputStream input, long limit) {
+            this.input = input;
+            this.remaining = limit;
+        }
+
+        @Override
+        public int read() throws IOException {
+            if (remaining <= 0) {
+                return -1;
+            }
+            int value = input.read();
+            if (value >= 0) {
+                remaining--;
+            }
+            return value;
+        }
+
+        @Override
+        public int read(byte[] buffer, int offset, int length) throws IOException {
+            if (remaining <= 0) {
+                return -1;
+            }
+            int count = input.read(buffer, offset, (int) Math.min(length, remaining));
+            if (count > 0) {
+                remaining -= count;
+            }
+            return count;
+        }
+    }
+
     private static void writeStatus(OutputStream output, String status) throws IOException {
         output.write(("HTTP/1.1 " + status + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             .getBytes(StandardCharsets.US_ASCII));
@@ -261,7 +494,7 @@ final class RdpGateway {
     }
 
     /** The tunnel, X.224 response and TLS connection to one RDP server. */
-    private static final class ServerLink implements java.io.Closeable {
+    private final class ServerLink implements java.io.Closeable {
         AccessWebSocket tunnel;
         Socket[] pair;
         SSLSocket tls;
@@ -277,6 +510,7 @@ final class RdpGateway {
                 closeQuietly(pair[1]);
             }
             if (tunnel != null) {
+                openTunnels.remove(tunnel);
                 tunnel.close();
             }
         }
@@ -299,7 +533,7 @@ final class RdpGateway {
             sessionToken = request.proxyAuth;
             setStage(sessionToken, "tunnel");
             setError(sessionToken, null);
-            String token = environment.loadToken(host);
+            AccessCredential token = environment.loadCredential(host);
             if (token == null) {
                 setError(sessionToken, "Cloudflare sign-in required");
                 notifyLoginRequired(host);
@@ -331,7 +565,15 @@ final class RdpGateway {
             sendPdu(client, RdCleanPath.encodeResponse(host + ":" + TLS_PORT, link.x224Response, chain));
 
             setStage(sessionToken, "relay");
-            relay(client, link.tls);
+            RdpTrace trace = new RdpTrace();
+            sessionTraces.put(sessionToken, trace);
+            String ended = relay(client, link.tls, trace);
+            String tunnelClose = link.tunnel.closeReason();
+            sessionRelayEnds.put(
+                sessionToken,
+                ended + (tunnelClose.isEmpty() ? "" : " (Cloudflare tunnel: " + tunnelClose + ")")
+                    + " | " + trace.summary()
+            );
         } catch (ReportedException exception) {
             // The client already has the error.
         } catch (Exception exception) {
@@ -360,7 +602,7 @@ final class RdpGateway {
         AccessWebSocket client,
         String sessionToken,
         String host,
-        String token,
+        AccessCredential token,
         RdCleanPath.Request request,
         boolean rsaKeyExchange
     ) throws Exception {
@@ -370,7 +612,15 @@ final class RdpGateway {
             setStage(sessionToken, "tunnel");
             try {
                 link.tunnel = environment.openTunnel(host, token);
+                openTunnels.add(link.tunnel);
             } catch (AccessWebSocket.LoginRequiredException exception) {
+                if (token.isServiceToken()) {
+                    // Signing in again would not help; report the token instead.
+                    setError(sessionToken, "Cloudflare Access rejected the service token "
+                        + "“" + token.serviceToken.name + "”");
+                    sendPdu(client, RdCleanPath.encodeGeneralError(403));
+                    throw new ReportedException();
+                }
                 setError(sessionToken, "Cloudflare sign-in required");
                 environment.clearToken(host);
                 notifyLoginRequired(host);
@@ -504,8 +754,9 @@ final class RdpGateway {
                     output.write(buffer, 0, count);
                     output.flush();
                 }
-            } catch (IOException ignored) {
-                // Closed.
+                tunnel.noteClose("ended without a close frame");
+            } catch (IOException exception) {
+                tunnel.noteClose("read failed: " + describe(exception));
             } finally {
                 closeQuietly(socket);
             }
@@ -514,12 +765,14 @@ final class RdpGateway {
             byte[] buffer = new byte[32 * 1024];
             try (InputStream input = socket.getInputStream()) {
                 for (int count = input.read(buffer); count >= 0; count = input.read(buffer)) {
-                    if (count > 0) {
-                        tunnel.sendBinary(buffer, 0, count);
+                    // Small frames: large ones (a file pasted from the phone)
+                    // made the Cloudflare tunnel drop the connection.
+                    for (int sent = 0; sent < count; sent += TUNNEL_FRAME_BYTES) {
+                        tunnel.sendBinary(buffer, sent, Math.min(TUNNEL_FRAME_BYTES, count - sent));
                     }
                 }
-            } catch (IOException ignored) {
-                // Closed.
+            } catch (IOException exception) {
+                tunnel.noteClose("write failed: " + describe(exception));
             } finally {
                 tunnel.close();
             }
@@ -530,29 +783,63 @@ final class RdpGateway {
         up.start();
     }
 
-    /** Relays client WebSocket messages to the TLS stream and back until either side closes. */
-    private static void relay(AccessWebSocket client, SSLSocket tls) throws IOException {
+    /**
+     * Relays client WebSocket messages to the TLS stream and back until either
+     * side closes. Returns which side ended first and why.
+     */
+    private static String relay(AccessWebSocket client, SSLSocket tls, RdpTrace trace) {
+        java.util.concurrent.atomic.AtomicReference<String> ended =
+            new java.util.concurrent.atomic.AtomicReference<>();
+        OutputStream output;
+        try {
+            output = tls.getOutputStream();
+        } catch (IOException exception) {
+            return "app side: " + describe(exception);
+        }
+        Object writeLock = new Object();
         Thread downstream = new Thread(() -> {
             byte[] buffer = new byte[32 * 1024];
             try (InputStream input = tls.getInputStream()) {
                 for (int count = input.read(buffer); count >= 0; count = input.read(buffer)) {
                     if (count > 0) {
+                        trace.fromServer(buffer, count);
+                        byte[] replay = trace.takeReplay();
+                        if (replay != null) {
+                            // Ahead of IronRDP's answer to the server's Monitor Ready.
+                            synchronized (writeLock) {
+                                output.write(replay);
+                                output.flush();
+                            }
+                        }
                         client.sendBinary(buffer, 0, count);
                     }
                 }
-            } catch (IOException ignored) {
-                // Closed.
+                ended.compareAndSet(null, "server closed the connection");
+            } catch (IOException exception) {
+                ended.compareAndSet(null, "server side: " + describe(exception));
             } finally {
                 client.close();
             }
         }, "RdpGateway-relay-down");
         downstream.setDaemon(true);
         downstream.start();
-        OutputStream output = tls.getOutputStream();
-        for (byte[] message = client.readMessage(); message != null; message = client.readMessage()) {
-            output.write(message);
-            output.flush();
+        try {
+            for (byte[] message = client.readMessage(); message != null; message = client.readMessage()) {
+                byte[] forward = trace.fromClient(message);
+                if (forward.length == 0) {
+                    continue;
+                }
+                synchronized (writeLock) {
+                    output.write(forward);
+                    output.flush();
+                }
+            }
+            ended.compareAndSet(null, "app closed the connection");
+        } catch (IOException exception) {
+            ended.compareAndSet(null, "app side: " + describe(exception));
         }
+        String reason = ended.get();
+        return reason == null ? "" : reason;
     }
 
     private static SSLContext trustAllContext() throws Exception {

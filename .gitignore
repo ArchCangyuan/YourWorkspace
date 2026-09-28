@@ -11,3 +11,4 @@ local.properties
 
 # Fetched by tools/fetch_rdp_client.sh
 android/app/src/main/assets/rdp/iron-remote-desktop*.js
+.ironrdp-build/

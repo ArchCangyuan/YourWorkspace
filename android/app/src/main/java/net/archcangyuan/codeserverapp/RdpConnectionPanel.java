@@ -31,6 +31,7 @@ import android.widget.Toast;
 
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Locale;
 
 /**
@@ -165,6 +166,8 @@ final class RdpConnectionPanel {
                 showLogin(null);
             }
         });
+        Button tokenButton = smallButton(accessRow, "Token");
+        tokenButton.setOnClickListener(view -> chooseServiceToken());
 
         LinearLayout userCard = card(content, "Windows sign-in");
         usernameField = new EditText(activity);
@@ -259,7 +262,7 @@ final class RdpConnectionPanel {
         } else {
             AccessTokenStore.clearPassword(activity, host);
         }
-        if (AccessTokenStore.loadToken(activity, host) == null) {
+        if (AccessTokenStore.credential(activity, host) == null) {
             showLogin(this::connectBuiltIn);
             return;
         }
@@ -276,7 +279,7 @@ final class RdpConnectionPanel {
     /** Uses another remote desktop app through the local tunnel. */
     private void connect() {
         saveUsername();
-        if (AccessTokenStore.loadToken(activity, host) == null) {
+        if (AccessTokenStore.credential(activity, host) == null) {
             showLogin(this::connect);
             return;
         }
@@ -291,7 +294,7 @@ final class RdpConnectionPanel {
 
     /** Tests Cloudflare, the token and the remote desktop without a client app. */
     private void probe() {
-        String token = AccessTokenStore.loadToken(activity, host);
+        AccessCredential token = AccessTokenStore.credential(activity, host);
         if (token == null) {
             showLogin(this::probe);
             return;
@@ -328,8 +331,15 @@ final class RdpConnectionPanel {
         if (dialog == null || host == null) {
             return;
         }
+        ServiceTokenStore.ServiceToken serviceToken =
+            ServiceTokenStore.forProject(activity, "rdp://" + host);
         String token = AccessTokenStore.loadToken(activity, host);
-        if (token != null) {
+        if (serviceToken != null) {
+            accessStatus.setText("Service token “" + serviceToken.name + "”");
+            accessStatus.setTextColor(SIGNED_IN);
+            accessButton.setVisibility(View.GONE);
+        } else if (token != null) {
+            accessButton.setVisibility(View.VISIBLE);
             long expiresAt = AccessTokenStore.expiresAtMillis(token);
             accessStatus.setText(expiresAt > 0
                 ? "Signed in · expires in " + formatRemaining(expiresAt - System.currentTimeMillis())
@@ -337,6 +347,7 @@ final class RdpConnectionPanel {
             accessStatus.setTextColor(SIGNED_IN);
             accessButton.setText("Sign out");
         } else {
+            accessButton.setVisibility(View.VISIBLE);
             accessStatus.setText("Not signed in");
             accessStatus.setTextColor(MUTED);
             accessButton.setText("Sign in");
@@ -396,6 +407,42 @@ final class RdpConnectionPanel {
                 Toast.LENGTH_LONG
             ).show();
         }
+    }
+
+    /** Chooses between the browser sign-in and a saved service token for this host. */
+    private void chooseServiceToken() {
+        List<ServiceTokenStore.ServiceToken> tokens = ServiceTokenStore.list(activity);
+        if (tokens.isEmpty()) {
+            Toast.makeText(
+                activity,
+                "Add a service token in Settings → Cloudflare Access service tokens",
+                Toast.LENGTH_LONG
+            ).show();
+            return;
+        }
+        String current = ServiceTokenStore.projectTokenId(activity, "rdp://" + host);
+        CharSequence[] labels = new CharSequence[tokens.size() + 1];
+        labels[0] = "Browser sign-in (email code)";
+        int checked = 0;
+        for (int index = 0; index < tokens.size(); index++) {
+            labels[index + 1] = tokens.get(index).name;
+            if (tokens.get(index).id.equals(current)) {
+                checked = index + 1;
+            }
+        }
+        new AlertDialog.Builder(activity)
+            .setTitle(boldText("Cloudflare Access for " + host))
+            .setSingleChoiceItems(labels, checked, (chooser, which) -> {
+                ServiceTokenStore.setForProject(
+                    activity,
+                    "rdp://" + host,
+                    which == 0 ? null : tokens.get(which - 1).id
+                );
+                chooser.dismiss();
+                refresh();
+            })
+            .setNegativeButton("Cancel", null)
+            .show();
     }
 
     private void signOut() {

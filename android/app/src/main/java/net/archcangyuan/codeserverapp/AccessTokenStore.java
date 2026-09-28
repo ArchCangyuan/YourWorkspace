@@ -56,6 +56,20 @@ final class AccessTokenStore {
         }
     }
 
+    /**
+     * The Cloudflare Access credential for a remote desktop host: the service
+     * token chosen for its project, else the signed-in session token, else null.
+     */
+    static AccessCredential credential(Context context, String host) {
+        ServiceTokenStore.ServiceToken serviceToken =
+            ServiceTokenStore.forProject(context, "rdp://" + host);
+        if (serviceToken != null) {
+            return AccessCredential.service(serviceToken);
+        }
+        String token = loadToken(context, host);
+        return token == null ? null : AccessCredential.session(token);
+    }
+
     static void clearToken(Context context, String host) {
         preferences(context).edit().remove(TOKEN_PREFIX + key(host)).apply();
     }
@@ -101,7 +115,7 @@ final class AccessTokenStore {
         preferences(context).edit().remove(PASSWORD_PREFIX + key(host)).apply();
     }
 
-    private static String encrypt(String plainText) {
+    static String encrypt(String plainText) {
         try {
             Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
             cipher.init(Cipher.ENCRYPT_MODE, secretKey());
@@ -113,7 +127,7 @@ final class AccessTokenStore {
         }
     }
 
-    private static String decrypt(String value) throws Exception {
+    static String decrypt(String value) throws Exception {
         String[] parts = value.split(":", 2);
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(
@@ -138,7 +152,7 @@ final class AccessTokenStore {
         return host.trim().toLowerCase(Locale.US);
     }
 
-    private static SharedPreferences preferences(Context context) {
+    static SharedPreferences preferences(Context context) {
         return context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE);
     }
 

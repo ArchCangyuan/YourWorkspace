@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 12 and higher. Cloudflare Access credentials are encrypted with a
+     device-bound Keystore key and must not be backed up or transferred. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="cloudflare_access.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="cloudflare_access.xml" />
+    </device-transfer>
+</data-extraction-rules>

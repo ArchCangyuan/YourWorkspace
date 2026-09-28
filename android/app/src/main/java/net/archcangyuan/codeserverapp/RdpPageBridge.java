@@ -88,13 +88,36 @@ final class RdpPageBridge {
         return current == null || !sessions.containsKey(gatewayToken) ? "{}" : current.status(gatewayToken);
     }
 
+    /** Adds a timestamped line from the page to the gateway's clipboard log. */
+    @JavascriptInterface
+    public void gatewayNote(String gatewayToken, String text) {
+        RdpGateway current = gateway;
+        if (current != null && sessions.containsKey(gatewayToken)) {
+            current.note(gatewayToken, text);
+        }
+    }
+
+    /** Switches a gateway clipboard rewrite; see {@link RdpTrace#setOption}. */
+    @JavascriptInterface
+    public boolean gatewayOption(String gatewayToken, String name, boolean value) {
+        return sessions.containsKey(gatewayToken) && RdpTrace.setOption(name, value);
+    }
+
     @JavascriptInterface
     public String clipboardText() {
         FutureTask<String> read = new FutureTask<>(() -> {
+            // Without window focus (e.g. a file picker in front) Android hides the
+            // clipboard. null tells the page "unknown", not "empty": an empty
+            // read would look like a new copy and replace the PC's clipboard.
+            if (!activity.hasWindowFocus()) {
+                return null;
+            }
             ClipboardManager clipboard = activity.getSystemService(ClipboardManager.class);
             ClipData clip = clipboard == null ? null : clipboard.getPrimaryClip();
             if (clip == null || clip.getItemCount() == 0) {
-                return "";
+                // Android also answers null when it denies the read, so this
+                // is "unknown": a flip to "" would be sent to the PC as a copy.
+                return null;
             }
             CharSequence text = clip.getItemAt(0).coerceToText(activity);
             return text == null ? "" : text.toString();
@@ -103,7 +126,7 @@ final class RdpPageBridge {
         try {
             return read.get(2, TimeUnit.SECONDS);
         } catch (Exception exception) {
-            return "";
+            return null;
         }
     }
 
