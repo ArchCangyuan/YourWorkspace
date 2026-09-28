@@ -347,12 +347,39 @@
 
   let lastResizeAt = 0;
   let pendingFitTimer = 0;
+  let catchUpAttempts = 0;
+  // Sizes asked for in the last seconds. Windows can apply an earlier request
+  // late (e.g. the size with the keyboard open after it closed again); such
+  // a frame is a stale answer, not the server's limit.
+  const recentRequests = [];
+  const sameSize = (a, b) => a && b && Math.abs(a.width - b.width) <= 2 && Math.abs(a.height - b.height) <= 2;
+  const isStaleAnswer = (applied, requested) => {
+    const now = Date.now();
+    while (recentRequests.length && now - recentRequests[0].at > 15000) recentRequests.shift();
+    return !sameSize(applied, requested) && recentRequests.some((entry) => sameSize(applied, entry.size));
+  };
   const resizeDesktop = (size) => {
     lastResizeAt = Date.now();
+    recentRequests.push({ size, at: lastResizeAt });
+    if (recentRequests.length > 8) recentRequests.shift();
     ui.resize(size.width, size.height);
     window.clearTimeout(pendingFitTimer);
-    pendingFitTimer = window.setTimeout(() => fitDisplay(), 10100);
+    pendingFitTimer = window.setTimeout(catchUp, 4000);
   };
+  // A frame still not at the requested size a while after the last request
+  // (a dropped or overtaken resize): ask again, a few times.
+  function catchUp() {
+    fitDisplay();
+    const canvas = rendererCanvas();
+    if (!connected || resizeInFlight || !canvas || !connectedSize) return;
+    if (sameSize({ width: canvas.width, height: canvas.height }, connectedSize)) {
+      catchUpAttempts = 0;
+      return;
+    }
+    if (catchUpAttempts >= 3) return;
+    catchUpAttempts += 1;
+    requestSize(desktopSize());
+  }
 
   const rendererCanvas = () => element.shadowRoot?.querySelector('canvas') || null;
 
@@ -364,14 +391,13 @@
     if (!canvas || !canvas.width || !canvas.height) return;
     const available = availableSize();
     // Until the server applies the requested size the frame has the old
-    // aspect: fill the width (the keyboard may cover the bottom for a moment)
-    // instead of shrinking it into a black-edged box. A server that has not
-    // followed after 10 s gets its frame fitted.
-    const pending = connectedSize && Date.now() - lastResizeAt < 10000
-      && (Math.abs(canvas.width - connectedSize.width) > 2
-        || Math.abs(canvas.height - connectedSize.height) > 2);
+    // aspect: cover the whole area (cropping an edge for a moment) instead of
+    // leaving a black strip, e.g. where the keyboard was. A server that has
+    // not followed after 15 s gets its frame fitted.
+    const pending = connectedSize && Date.now() - lastResizeAt < 15000
+      && !sameSize({ width: canvas.width, height: canvas.height }, connectedSize);
     const scale = resizeInFlight || pending
-      ? canvas.width / available.width
+      ? Math.min(canvas.width / available.width, canvas.height / available.height)
       : Math.max(canvas.width / available.width, canvas.height / available.height);
     element.style.setProperty('--rdp-width', `${canvas.width / scale}px`);
     element.style.setProperty('--rdp-height', `${canvas.height / scale}px`);
@@ -437,13 +463,15 @@
         && Math.abs(applied.width - requested.width) <= 2
         && Math.abs(applied.height - requested.height) <= 2;
       if (matches) {
+        catchUpAttempts = 0;
         fitDisplay();
         resizeSettled();
         return;
       }
       // The server answered with another size (e.g. capped): act on it now.
       // Otherwise wait for it, up to 2.5 s.
-      const responded = applied
+      const stale = applied && isStaleAnswer(applied, requested);
+      const responded = applied && !stale
         && (!before || applied.width !== before.width || applied.height !== before.height);
       if (!responded && Date.now() - started < 2500) {
         checkTimer = window.setTimeout(poll, 100);
@@ -642,6 +670,7 @@
       changedWhileInFlight = true;
       return;
     }
+    catchUpAttempts = 0;
     requestSize(size);
   }
   let areaFrame = 0;

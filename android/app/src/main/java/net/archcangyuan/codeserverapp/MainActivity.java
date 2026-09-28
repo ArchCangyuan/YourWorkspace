@@ -1114,7 +1114,7 @@ public final class MainActivity extends Activity {
             cursorX: -1,
             cursorY: -1,
             // Per mouse button (0 left, 2 right): held down, locked down after
-            // a 2 s press, armed (lock reached, finger still on the button),
+            // a 1 s press, armed (lock reached, finger still on the button),
             // released by the next tap (unlockPending), moved while held.
             buttons: {
               0: { held: false, locked: false, armed: false, unlockPending: false, moved: false, timer: 0 },
@@ -1508,7 +1508,7 @@ public final class MainActivity extends Activity {
               .ring .bar { stroke: #d0bcff; stroke-linecap: round;
                 stroke-dasharray: 100.53; stroke-dashoffset: 100.53; }
               .button.charging .ring .bar { stroke-dashoffset: 0;
-                transition: stroke-dashoffset 2000ms linear; }
+                transition: stroke-dashoffset 1000ms linear; }
               .button.locked .ring .bar { stroke: #fff; stroke-dashoffset: 0; }
               .label { position: relative; line-height: 1; }
             </style>
@@ -1595,10 +1595,10 @@ public final class MainActivity extends Activity {
             mouseAction('move', x, y);
           };
 
-          // Holding L or R for 2 s (without moving the cursor) locks it down,
+          // Holding L or R for 1 s (without moving the cursor) locks it down,
           // shown by the ring around the button filling up; the next tap on
           // that button releases it.
-          const BUTTON_LOCK_MS = 2000;
+          const BUTTON_LOCK_MS = 1000;
 
           const clearButtonLockTimer = (state) => {
             if (state.timer) window.clearTimeout(state.timer);
