@@ -170,6 +170,11 @@ final class RdpTrace {
                 le32(data, field + 12), le32(data, field + 20)));
         } else if (type == 9 && field + 4 <= end) {
             line.append(" stream=").append(le32(data, field));
+        } else if (type == 5 && dataLength == 4 && field + 4 <= end) {
+            // A 4-byte answer is the Preferred DropEffect value (1 = copy).
+            line.append(" value=").append(le32(data, field));
+        } else if (type == 2 && dataLength > 0) {
+            line.append(" formats=").append(formatNames(data, field, (int) Math.min(end, field + dataLength)));
         }
         line.append(" len=").append(dataLength);
         if (total > 1600) {
@@ -179,6 +184,30 @@ final class RdpTrace {
         while (clipEvents.size() > MAX_CLIP_EVENTS) {
             clipEvents.removeFirst();
         }
+    }
+
+    /** Ids and names in a long-format-name Format List. */
+    private static String formatNames(byte[] data, int start, int end) {
+        StringBuilder names = new StringBuilder();
+        int at = start;
+        while (at + 4 < end && names.length() < 160) {
+            long id = le32(data, at);
+            at += 4;
+            StringBuilder name = new StringBuilder();
+            while (at + 1 < end) {
+                char c = (char) ((data[at] & 0xFF) | ((data[at + 1] & 0xFF) << 8));
+                at += 2;
+                if (c == 0) {
+                    break;
+                }
+                name.append(c);
+            }
+            names.append(names.length() == 0 ? "" : ",").append(Long.toHexString(id));
+            if (name.length() > 0) {
+                names.append(':').append(name);
+            }
+        }
+        return names.toString();
     }
 
     private static String clipTypeName(int type) {
