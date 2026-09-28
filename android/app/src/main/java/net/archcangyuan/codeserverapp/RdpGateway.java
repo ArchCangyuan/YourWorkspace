@@ -550,11 +550,13 @@ final class RdpGateway {
             sendPdu(client, RdCleanPath.encodeResponse(host + ":" + TLS_PORT, link.x224Response, chain));
 
             setStage(sessionToken, "relay");
-            String ended = relay(client, link.tls);
+            RdpTrace trace = new RdpTrace();
+            String ended = relay(client, link.tls, trace);
             String tunnelClose = link.tunnel.closeReason();
             sessionRelayEnds.put(
                 sessionToken,
                 ended + (tunnelClose.isEmpty() ? "" : " (Cloudflare tunnel: " + tunnelClose + ")")
+                    + " | " + trace.summary()
             );
         } catch (ReportedException exception) {
             // The client already has the error.
@@ -767,7 +769,7 @@ final class RdpGateway {
      * Relays client WebSocket messages to the TLS stream and back until either
      * side closes. Returns which side ended first and why.
      */
-    private static String relay(AccessWebSocket client, SSLSocket tls) {
+    private static String relay(AccessWebSocket client, SSLSocket tls, RdpTrace trace) {
         java.util.concurrent.atomic.AtomicReference<String> ended =
             new java.util.concurrent.atomic.AtomicReference<>();
         Thread downstream = new Thread(() -> {
@@ -775,6 +777,7 @@ final class RdpGateway {
             try (InputStream input = tls.getInputStream()) {
                 for (int count = input.read(buffer); count >= 0; count = input.read(buffer)) {
                     if (count > 0) {
+                        trace.fromServer(buffer, count);
                         client.sendBinary(buffer, 0, count);
                     }
                 }
@@ -790,6 +793,7 @@ final class RdpGateway {
         try {
             OutputStream output = tls.getOutputStream();
             for (byte[] message = client.readMessage(); message != null; message = client.readMessage()) {
+                trace.fromClient(message);
                 output.write(message);
                 output.flush();
             }
