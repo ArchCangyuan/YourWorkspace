@@ -1045,6 +1045,19 @@
     ui.enableFileTransfer(fileTransfer);
     // enableFileTransfer wires these to pause/resume clipboard monitoring
     // around sending the file list; the page holds the pause itself.
+    // Log what Windows asks for, to show in the upload bar's Log.
+    const serveRequest = fileTransfer.handleFileContentsRequest?.bind(fileTransfer);
+    if (serveRequest) {
+      let logged = 0;
+      fileTransfer.handleFileContentsRequest = (request) => {
+        if (logged < 20) {
+          logged += 1;
+          console.info(`upload: PC requests file ${request.index} flags=${request.flags} `
+            + `position=${request.position} size=${request.size}`);
+        }
+        return serveRequest(request);
+      };
+    }
     clipboardHold.suppress = fileTransfer.onUploadStarted;
     clipboardHold.resume = fileTransfer.onUploadFinished;
     fileTransfer.onUploadFinished = () => {};

@@ -100,7 +100,9 @@ final class RdpPageBridge {
             ClipboardManager clipboard = activity.getSystemService(ClipboardManager.class);
             ClipData clip = clipboard == null ? null : clipboard.getPrimaryClip();
             if (clip == null || clip.getItemCount() == 0) {
-                return "";
+                // Android also answers null when it denies the read, so this
+                // is "unknown": a flip to "" would be sent to the PC as a copy.
+                return null;
             }
             CharSequence text = clip.getItemAt(0).coerceToText(activity);
             return text == null ? "" : text.toString();
