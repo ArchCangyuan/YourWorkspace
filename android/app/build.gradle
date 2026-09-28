@@ -14,10 +14,28 @@ android {
         versionName "1.1"
     }
 
+    // A fixed key (from CI secrets) so each build installs over the last one.
+    // Without it Gradle signs with a per-machine debug key, and every CI
+    // build then needs an uninstall first.
+    def keystoreFile = System.getenv("YW_KEYSTORE_FILE")
+    signingConfigs {
+        if (keystoreFile) {
+            fixed {
+                storeFile file(keystoreFile)
+                storePassword System.getenv("YW_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("YW_KEY_ALIAS") ?: "yourworkspace"
+                keyPassword System.getenv("YW_KEYSTORE_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         debug {
             applicationIdSuffix ".debug"
             versionNameSuffix "-debug"
+            if (keystoreFile) {
+                signingConfig signingConfigs.fixed
+            }
         }
         release {
             minifyEnabled false

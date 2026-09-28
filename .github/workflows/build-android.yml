@@ -48,6 +48,21 @@ jobs:
       - name: Fetch built-in remote desktop client
         run: ./tools/fetch_rdp_client.sh
 
+      - name: Set up signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          if [[ -z "$KEYSTORE_BASE64" || -z "$KEYSTORE_PASSWORD" ]]; then
+            echo "::warning::ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD not set: signing with a one-off debug key, so this APK will not install over earlier builds."
+            exit 0
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/yourworkspace.keystore"
+          {
+            echo "YW_KEYSTORE_FILE=$RUNNER_TEMP/yourworkspace.keystore"
+            echo "YW_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+          } >> "$GITHUB_ENV"
+
       - name: Build debug APK
         run: gradle --no-daemon -p android clean assembleDebug
 
