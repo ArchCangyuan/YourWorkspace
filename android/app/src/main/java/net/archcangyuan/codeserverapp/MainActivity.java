@@ -1849,6 +1849,37 @@ public final class MainActivity extends Activity {
             return true;
           };
 
+          // Keyboard locked open on a remote desktop page: Chromium hides the
+          // keyboard whenever a tap lands on something it cannot type into,
+          // such as the IronRDP canvas, and the app then brings it back (a
+          // visible flash). Marked editable, the canvas keeps it up; typing
+          // still goes through the app's own input connection to IronRDP.
+          let keyboardHeldOpen = false;
+          const applyKeyboardHeldOpen = () => {
+            if (!window.__yourWorkspaceRdpPage) return;
+            const canvas = findIronRdpCanvas();
+            if (!canvas) return;
+            if (keyboardHeldOpen) {
+              if (canvas.getAttribute('contenteditable') !== 'true') {
+                canvas.setAttribute('contenteditable', 'true');
+                canvas.setAttribute('spellcheck', 'false');
+                canvas.style.caretColor = 'transparent';
+                canvas.style.outline = 'none';
+              }
+            } else if (canvas.hasAttribute('contenteditable')) {
+              canvas.removeAttribute('contenteditable');
+            }
+          };
+          // The canvas is replaced on reconnect: re-apply before each touch.
+          document.addEventListener('pointerdown', () => {
+            if (keyboardHeldOpen) applyKeyboardHeldOpen();
+          }, true);
+          const setKeyboardHeldOpen = (held) => {
+            keyboardHeldOpen = held;
+            applyKeyboardHeldOpen();
+            return true;
+          };
+
           const bridge = {
             version: 17,
             forceKeyboard,
@@ -1870,6 +1901,9 @@ public final class MainActivity extends Activity {
             },
             setKeyboardLocked(locked) {
               return setKeyboardLocked(Boolean(locked));
+            },
+            setKeyboardHeldOpen(held) {
+              return setKeyboardHeldOpen(Boolean(held));
             },
             setModifiers(control, shift) {
               const nextControl = Boolean(control);
@@ -4469,14 +4503,16 @@ public final class MainActivity extends Activity {
             ? target.getWidth()
             : (webContainer == null ? 0 : webContainer.getWidth());
         float widthDp = widthPx / getResources().getDisplayMetrics().density;
+        int lock = target == webView ? keyboardLock : keyboardLockFor(sessionKeyOf(target));
         String script = String.format(
             Locale.US,
             "window.__codeServerAppKeyboard"
                 + " && typeof window.__codeServerAppKeyboard.setMouseMode === 'function'"
                 + " ? (window.__codeServerAppKeyboard.setKeyboardLocked?.(%b),"
+                + " window.__codeServerAppKeyboard.setKeyboardHeldOpen?.(%b),"
                 + " window.__codeServerAppKeyboard.setMouseMode(%b, %.2f)) : false",
-            (target == webView ? keyboardLock : keyboardLockFor(sessionKeyOf(target)))
-                == KEYBOARD_LOCKED_HIDDEN,
+            lock == KEYBOARD_LOCKED_HIDDEN,
+            lock == KEYBOARD_LOCKED_OPEN,
             target == webView ? mouseModeEnabled : mouseModeFor(sessionKeyOf(target)),
             widthDp
         );
