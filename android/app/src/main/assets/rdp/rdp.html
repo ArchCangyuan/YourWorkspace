@@ -1075,13 +1075,21 @@
     const serveRequest = fileTransfer.handleFileContentsRequest?.bind(fileTransfer);
     if (serveRequest) {
       let logged = 0;
+      // Windows asks for a whole file in one range request, and a single
+      // response of more than a few dozen KB drops the session (small files
+      // work). Answer at most 32 KB; Windows reads on from the new position.
+      const MAX_RANGE = 32 * 1024;
       fileTransfer.handleFileContentsRequest = (request) => {
+        const capped = (request.flags & 2) && request.size > MAX_RANGE
+          ? { ...request, size: MAX_RANGE }
+          : request;
         if (logged < 20) {
           logged += 1;
           console.info(`upload: PC requests file ${request.index} flags=${request.flags} `
-            + `position=${request.position} size=${request.size}`);
+            + `position=${request.position} size=${request.size}`
+            + (capped === request ? '' : ` (sending ${capped.size})`));
         }
-        return serveRequest(request);
+        return serveRequest(capped);
       };
     }
     clipboardHold.suppress = fileTransfer.onUploadStarted;
