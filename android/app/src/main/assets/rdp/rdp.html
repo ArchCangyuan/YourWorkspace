@@ -910,7 +910,9 @@
     logView.hidden = true;
     logButton.addEventListener('click', () => {
       logView.hidden = !logView.hidden;
-      logView.textContent = clipboardLog.join('\n') || '(no clipboard messages)';
+      const channel = gatewayStatus().clipboard;
+      logView.textContent = (clipboardLog.join('\n') || '(no clipboard messages)')
+        + (channel ? `\n--- clipboard channel (gateway) ---\n${channel}` : '');
       window.clearTimeout(uploadHideTimer);
     });
     header.append(title, paste, logButton, close);

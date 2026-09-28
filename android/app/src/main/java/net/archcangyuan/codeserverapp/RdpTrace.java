@@ -6,7 +6,8 @@ import java.util.Locale;
 /**
  * Watches one relayed RDP session. It records, for diagnosing disconnects, the
  * virtual channel messages the client sent (with their chunk headers) and the
- * last bytes the server sent before the connection ended.
+ * last bytes the server sent before the connection ended, and a running log
+ * of the clipboard (cliprdr) conversation in both directions.
  */
 final class RdpTrace {
     private static final int IO_CHANNEL_GUESS = 1003;
@@ -21,6 +22,9 @@ final class RdpTrace {
     private byte[] pending = new byte[0];
     private int cliprdrIndex = -1;
     private int cliprdrChannel = -1;
+    private byte[] serverPending = new byte[0];
+    private final ArrayDeque<String> clipEvents = new ArrayDeque<>();
+    private static final int MAX_CLIP_EVENTS = 40;
 
     // The virtual channel message being chunked, if any.
     private int chunkChannel = -1;
@@ -60,6 +64,7 @@ final class RdpTrace {
             }
             if ((data[offset] & 0xFF) == 3) {
                 slowPath(data, offset, length);
+                clipEvent("app->PC", data, offset, length, 0x64);
             }
             offset += length;
         }
@@ -70,6 +75,28 @@ final class RdpTrace {
         bytesDown += count;
         if (cliprdrChannel < 0 && cliprdrIndex >= 0) {
             cliprdrChannel = findServerChannelId(data, count, cliprdrIndex);
+        }
+        if (cliprdrChannel >= 0) {
+            byte[] joined = new byte[serverPending.length + count];
+            System.arraycopy(serverPending, 0, joined, 0, serverPending.length);
+            System.arraycopy(data, 0, joined, serverPending.length, count);
+            int offset = 0;
+            while (offset < joined.length) {
+                int length = pduLength(joined, offset);
+                if (length <= 0) {
+                    joined = new byte[0];
+                    offset = 0;
+                    break;
+                }
+                if (offset + length > joined.length) {
+                    break;
+                }
+                if ((joined[offset] & 0xFF) == 3) {
+                    clipEvent("PC->app", joined, offset, length, 0x68);
+                }
+                offset += length;
+            }
+            serverPending = java.util.Arrays.copyOfRange(joined, offset, joined.length);
         }
         if (count >= TAIL_BYTES) {
             System.arraycopy(data, count - TAIL_BYTES, tail, 0, TAIL_BYTES);
@@ -98,6 +125,77 @@ final class RdpTrace {
             text.append(String.format(Locale.US, " %02x", tail[index] & 0xFF));
         }
         return text.toString();
+    }
+
+    /** The recent clipboard messages, one per line. */
+    synchronized String clipboardLog() {
+        return String.join("\n", clipEvents);
+    }
+
+    /** Logs the start of a cliprdr message (its first chunk) in an MCS data PDU. */
+    private void clipEvent(String direction, byte[] data, int offset, int length, int mcsChoice) {
+        int end = offset + length;
+        int mcs = offset + 7;
+        if (cliprdrChannel < 0 || mcs + 7 > end || (data[mcs] & 0xFF) != mcsChoice) {
+            return;
+        }
+        int channel = ((data[mcs + 3] & 0xFF) << 8) | (data[mcs + 4] & 0xFF);
+        int userData = mcs + 7 + (((data[mcs + 6] & 0xFF) & 0x80) != 0 ? 1 : 0);
+        if (channel != cliprdrChannel || userData + 16 > end) {
+            return;
+        }
+        long total = le32(data, userData);
+        long chunkFlags = le32(data, userData + 4);
+        if ((chunkFlags & 0x1) == 0) {
+            return;
+        }
+        int body = userData + 8;
+        int type = (data[body] & 0xFF) | ((data[body + 1] & 0xFF) << 8);
+        int flags = (data[body + 2] & 0xFF) | ((data[body + 3] & 0xFF) << 8);
+        long dataLength = le32(data, body + 4);
+        StringBuilder line = new StringBuilder(String.format(
+            Locale.US, "%tT.%<tL %s %s", System.currentTimeMillis(), direction, clipTypeName(type)));
+        if (flags == 1) {
+            line.append(" OK");
+        } else if (flags == 2) {
+            line.append(" FAIL");
+        }
+        int field = body + 8;
+        if ((type == 4 || type == 10 || type == 11) && field + 4 <= end) {
+            line.append(type == 4 ? " format=0x" : " id=").append(
+                type == 4 ? Long.toHexString(le32(data, field)) : String.valueOf(le32(data, field)));
+        } else if (type == 8 && field + 28 <= end) {
+            line.append(String.format(Locale.US, " stream=%d file=%d flags=%d pos=%d size=%d",
+                le32(data, field), le32(data, field + 4), le32(data, field + 8),
+                le32(data, field + 12), le32(data, field + 20)));
+        } else if (type == 9 && field + 4 <= end) {
+            line.append(" stream=").append(le32(data, field));
+        }
+        line.append(" len=").append(dataLength);
+        if (total > 1600) {
+            line.append(" (").append(total).append(" B chunked)");
+        }
+        clipEvents.addLast(line.toString());
+        while (clipEvents.size() > MAX_CLIP_EVENTS) {
+            clipEvents.removeFirst();
+        }
+    }
+
+    private static String clipTypeName(int type) {
+        switch (type) {
+            case 1: return "MonitorReady";
+            case 2: return "FormatList";
+            case 3: return "FormatListResponse";
+            case 4: return "FormatDataRequest";
+            case 5: return "FormatDataResponse";
+            case 6: return "TempDirectory";
+            case 7: return "Capabilities";
+            case 8: return "FileContentsRequest";
+            case 9: return "FileContentsResponse";
+            case 10: return "Lock";
+            case 11: return "Unlock";
+            default: return "type" + type;
+        }
     }
 
     private static int pduLength(byte[] data, int offset) {

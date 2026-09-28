@@ -76,6 +76,8 @@ final class RdpGateway {
     private final Map<String, String> sessionErrors = new ConcurrentHashMap<>();
     /** Why the last relay of a session ended (which side, and any error). */
     private final Map<String, String> sessionRelayEnds = new ConcurrentHashMap<>();
+    /** The latest relay's trace per session, for the page's clipboard log. */
+    private final Map<String, RdpTrace> sessionTraces = new ConcurrentHashMap<>();
     private final java.util.Set<String> rsaKeyExchangeHosts = ConcurrentHashMap.newKeySet();
     private final SecureRandom random = new SecureRandom();
     // Cloudflare closes idle WebSockets after about 100 s; an idle or
@@ -204,6 +206,8 @@ final class RdpGateway {
             status.put("stage", sessionStages.getOrDefault(sessionToken, ""));
             status.put("error", sessionErrors.getOrDefault(sessionToken, ""));
             status.put("relayEnd", sessionRelayEnds.getOrDefault(sessionToken, ""));
+            RdpTrace trace = sessionTraces.get(sessionToken);
+            status.put("clipboard", trace == null ? "" : trace.clipboardLog());
         } catch (org.json.JSONException ignored) {
             // Fields are plain strings.
         }
@@ -553,6 +557,7 @@ final class RdpGateway {
 
             setStage(sessionToken, "relay");
             RdpTrace trace = new RdpTrace();
+            sessionTraces.put(sessionToken, trace);
             String ended = relay(client, link.tls, trace);
             String tunnelClose = link.tunnel.closeReason();
             sessionRelayEnds.put(
