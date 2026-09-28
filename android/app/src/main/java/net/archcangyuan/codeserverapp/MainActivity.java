@@ -1110,17 +1110,16 @@ public final class MainActivity extends Activity {
             cursor: null,
             left: null,
             right: null,
-            lockButton: null,
             touches: new Map(),
             cursorX: -1,
             cursorY: -1,
-            leftHeld: false,
-            leftLocked: false,
-            leftLockArmed: false,
-            leftMoved: false,
-            leftUnlockPending: false,
-            lockTimer: 0,
-            rightHeld: false,
+            // Per mouse button (0 left, 2 right): held down, locked down after
+            // a 2 s press, armed (lock reached, finger still on the button),
+            // released by the next tap (unlockPending), moved while held.
+            buttons: {
+              0: { held: false, locked: false, armed: false, unlockPending: false, moved: false, timer: 0 },
+              2: { held: false, locked: false, armed: false, unlockPending: false, moved: false, timer: 0 }
+            },
             // Set by the app's keyboard lock ("locked hidden"): like mouse mode,
             // editable elements get inputmode=none so the keyboard never opens.
             keyboardLocked: false,
@@ -1492,27 +1491,37 @@ public final class MainActivity extends Activity {
               .button {
                 position: absolute; box-sizing: border-box; border-radius: 50%;
                 display: flex; align-items: center; justify-content: center;
-                font-family: system-ui, sans-serif; font-weight: 700; color: #fff;
-                background: rgba(0, 0, 0, 0.31); border: 2px solid rgba(255, 255, 255, 0.6);
+                font-family: system-ui, sans-serif; font-weight: 600; color: #fff;
+                background: rgba(20, 20, 24, 0.42);
+                box-shadow: 0 1px 6px rgba(0, 0, 0, 0.35);
                 pointer-events: none; touch-action: none;
                 user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+                transition: background-color 120ms;
               }
-              .button.pressed { background: rgba(103, 80, 164, 0.67); }
-              .button.locked { background: rgba(103, 80, 164, 0.86); border-color: #fff; }
-              .button.lock { font-weight: 400; }
+              .button.pressed { background: rgba(103, 80, 164, 0.62); }
+              .button.locked { background: rgba(103, 80, 164, 0.88); }
+              /* The outline doubles as the hold-to-lock progress ring. */
+              .ring { position: absolute; inset: 0; width: 100%; height: 100%;
+                transform: rotate(-90deg); overflow: visible; }
+              .ring circle { fill: none; stroke-width: 2.4; }
+              .ring .track { stroke: rgba(255, 255, 255, 0.55); }
+              .ring .bar { stroke: #d0bcff; stroke-linecap: round;
+                stroke-dasharray: 100.53; stroke-dashoffset: 100.53; }
+              .button.charging .ring .bar { stroke-dashoffset: 0;
+                transition: stroke-dashoffset 2000ms linear; }
+              .button.locked .ring .bar { stroke: #fff; stroke-dashoffset: 0; }
+              .label { position: relative; line-height: 1; }
             </style>
             <svg class="cursor" viewBox="0 0 14 22">
               <path d="M0.7 0.7 L0.7 18.5 L5.2 14.3 L8.3 21 L11.3 19.7 L8.2 13.1 L13.7 13.1 Z"
                 fill="#fff" stroke="#000" stroke-width="1.4" stroke-linejoin="round"/>
             </svg>
-            <div class="button left">L</div>
-            <div class="button right">R</div>
-            <div class="button lock" title="Hold the left button">🔓</div>`;
+            <div class="button left"><svg class="ring" viewBox="0 0 36 36"><circle class="track" cx="18" cy="18" r="16"/><circle class="bar" cx="18" cy="18" r="16"/></svg><span class="label">L</span></div>
+            <div class="button right"><svg class="ring" viewBox="0 0 36 36"><circle class="track" cx="18" cy="18" r="16"/><circle class="bar" cx="18" cy="18" r="16"/></svg><span class="label">R</span></div>`;
             mouseMode.host = host;
             mouseMode.cursor = root.querySelector('.cursor');
             mouseMode.left = root.querySelector('.left');
             mouseMode.right = root.querySelector('.right');
-            mouseMode.lockButton = root.querySelector('.lock');
             document.documentElement.appendChild(host);
           };
 
@@ -1526,16 +1535,12 @@ public final class MainActivity extends Activity {
 
           const updateMouseButtons = () => {
             if (!mouseMode.left) return;
-            const leftLocked = mouseMode.leftLocked || mouseMode.leftLockArmed;
-            mouseMode.left.classList.toggle(
-              'pressed',
-              mouseMode.leftHeld || mouseMode.leftUnlockPending
-            );
-            mouseMode.left.classList.toggle('locked', leftLocked);
-            mouseMode.left.textContent = leftLocked ? 'L🔒' : 'L';
-            mouseMode.right.classList.toggle('pressed', mouseMode.rightHeld);
-            mouseMode.lockButton.classList.toggle('locked', mouseMode.leftLocked);
-            mouseMode.lockButton.textContent = mouseMode.leftLocked ? '🔒' : '🔓';
+            for (const [button, element] of [[0, mouseMode.left], [2, mouseMode.right]]) {
+              const state = mouseMode.buttons[button];
+              element.classList.toggle('pressed', state.held || state.unlockPending);
+              element.classList.toggle('locked', state.locked || state.armed);
+              element.classList.toggle('charging', Boolean(state.timer));
+            }
           };
 
           const layoutMouseOverlay = () => {
@@ -1560,10 +1565,9 @@ public final class MainActivity extends Activity {
               fontSize: `${18 * scale}px`,
               borderWidth: `${2 * scale}px`
             });
-            place(mouseMode.left, 68, 84, 40);
-            place(mouseMode.right, 56, 16, 16);
-            place(mouseMode.lockButton, 42, 97, 120);
-            mouseMode.lockButton.style.fontSize = `${16 * scale}px`;
+            // Side by side like a mouse, L on the left, near the right edge.
+            place(mouseMode.left, 60, 88, 28);
+            place(mouseMode.right, 60, 18, 28);
             if (mouseMode.cursorX < 0) {
               mouseMode.cursorX = rect.left + rect.width / 2;
               mouseMode.cursorY = rect.top + rect.height / 2;
@@ -1577,103 +1581,88 @@ public final class MainActivity extends Activity {
             y = Math.min(Math.max(y, rect.top), rect.top + rect.height - 1);
             mouseMode.cursorX = x;
             mouseMode.cursorY = y;
-            if (mouseMode.leftHeld) mouseMode.leftMoved = true;
+            for (const state of Object.values(mouseMode.buttons)) {
+              if (!state.held) continue;
+              state.moved = true;
+              // Dragging with the button held: no lock, so stop the ring.
+              if (state.timer) {
+                window.clearTimeout(state.timer);
+                state.timer = 0;
+                updateMouseButtons();
+              }
+            }
             updateMouseCursor();
             mouseAction('move', x, y);
           };
 
-          const clearLeftLockTimer = () => {
-            if (mouseMode.lockTimer) window.clearTimeout(mouseMode.lockTimer);
-            mouseMode.lockTimer = 0;
+          // Holding L or R for 2 s (without moving the cursor) locks it down,
+          // shown by the ring around the button filling up; the next tap on
+          // that button releases it.
+          const BUTTON_LOCK_MS = 2000;
+
+          const clearButtonLockTimer = (state) => {
+            if (state.timer) window.clearTimeout(state.timer);
+            state.timer = 0;
           };
 
-          const mouseLeftDown = () => {
-            if (mouseMode.leftLocked) {
-              // Tap while drag-locked: release the button when this tap ends.
-              mouseMode.leftLocked = false;
-              mouseMode.leftUnlockPending = true;
+          const mouseButtonDown = (button) => {
+            const state = mouseMode.buttons[button];
+            if (state.locked) {
+              // Tap while locked: release the button when this tap ends.
+              state.locked = false;
+              state.unlockPending = true;
               updateMouseButtons();
               return;
             }
-            mouseMode.leftHeld = true;
-            mouseMode.leftLockArmed = false;
-            mouseMode.leftMoved = false;
-            mouseAction('down', mouseMode.cursorX, mouseMode.cursorY, 0);
-            clearLeftLockTimer();
-            mouseMode.lockTimer = window.setTimeout(() => {
-              mouseMode.lockTimer = 0;
-              if (!mouseMode.leftHeld || mouseMode.leftMoved) return;
-              mouseMode.leftLockArmed = true;
-              navigator.vibrate?.(15);
+            state.held = true;
+            state.armed = false;
+            state.moved = false;
+            mouseAction('down', mouseMode.cursorX, mouseMode.cursorY, button);
+            clearButtonLockTimer(state);
+            state.timer = window.setTimeout(() => {
+              state.timer = 0;
+              if (state.held && !state.moved) {
+                state.armed = true;
+                navigator.vibrate?.(20);
+              }
               updateMouseButtons();
-            }, 500);
+            }, BUTTON_LOCK_MS);
             updateMouseButtons();
           };
 
-          const mouseLeftUp = (cancelled) => {
-            clearLeftLockTimer();
-            if (mouseMode.leftUnlockPending) {
-              mouseMode.leftUnlockPending = false;
-              mouseMode.leftHeld = false;
-              mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 0);
+          const mouseButtonUp = (button, cancelled) => {
+            const state = mouseMode.buttons[button];
+            clearButtonLockTimer(state);
+            if (state.unlockPending) {
+              state.unlockPending = false;
+              state.held = false;
+              mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, button);
               updateMouseButtons();
               return;
             }
-            if (mouseMode.leftLocked) {
-              // Locked with the lock button while L was pressed: keep holding.
+            if (!state.held) return;
+            if (!cancelled && state.armed && !state.moved) {
+              state.armed = false;
+              state.locked = true;
               updateMouseButtons();
               return;
             }
-            if (!mouseMode.leftHeld) return;
-            if (!cancelled && mouseMode.leftLockArmed && !mouseMode.leftMoved) {
-              // Long press without movement: keep the button down for one-finger drags.
-              mouseMode.leftLockArmed = false;
-              mouseMode.leftLocked = true;
-              updateMouseButtons();
-              return;
-            }
-            mouseMode.leftHeld = false;
-            mouseMode.leftLockArmed = false;
-            mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 0);
-            updateMouseButtons();
-          };
-
-          // The lock button holds the left button down (for drags and selections)
-          // until it, or L, is tapped again.
-          const toggleLeftLock = () => {
-            clearLeftLockTimer();
-            mouseMode.leftLockArmed = false;
-            mouseMode.leftUnlockPending = false;
-            if (mouseMode.leftLocked) {
-              mouseMode.leftLocked = false;
-              if (mouseMode.leftHeld) {
-                mouseMode.leftHeld = false;
-                mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 0);
-              }
-            } else {
-              mouseMode.leftLocked = true;
-              if (!mouseMode.leftHeld) {
-                mouseMode.leftHeld = true;
-                mouseMode.leftMoved = false;
-                mouseAction('down', mouseMode.cursorX, mouseMode.cursorY, 0);
-              }
-            }
-            navigator.vibrate?.(15);
+            state.held = false;
+            state.armed = false;
+            mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, button);
             updateMouseButtons();
           };
 
           const releaseMouseButtons = () => {
-            clearLeftLockTimer();
             for (const held of [0, 2, 1]) {
               if (mouse.buttons & mouseButtonMask(held)) {
                 mouseAction('up', mouse.lastX, mouse.lastY, held);
               }
             }
-            mouseMode.leftHeld = false;
-            mouseMode.leftLocked = false;
-            mouseMode.leftLockArmed = false;
-            mouseMode.leftUnlockPending = false;
-            mouseMode.rightHeld = false;
+            for (const state of Object.values(mouseMode.buttons)) {
+              clearButtonLockTimer(state);
+              Object.assign(state, { held: false, locked: false, armed: false, unlockPending: false });
+            }
             mouseMode.touches.clear();
             updateMouseButtons();
           };
@@ -1716,9 +1705,7 @@ public final class MainActivity extends Activity {
                 const pageTouches = Array.from(mouseMode.touches.values())
                   .filter((info) => info.role === 'cursor' || info.role === 'anchor');
                 let role = 'cursor';
-                if (pointInElement(mouseMode.lockButton, x, y)) {
-                  role = 'lock';
-                } else if (pointInElement(mouseMode.left, x, y)) {
+                if (pointInElement(mouseMode.left, x, y)) {
                   role = 'left';
                 } else if (pointInElement(mouseMode.right, x, y)) {
                   role = 'right';
@@ -1738,14 +1725,10 @@ public final class MainActivity extends Activity {
                   startedAt: performance.now(),
                   moved: false
                 });
-                if (role === 'lock') {
-                  toggleLeftLock();
-                } else if (role === 'left') {
-                  mouseLeftDown();
+                if (role === 'left') {
+                  mouseButtonDown(0);
                 } else if (role === 'right') {
-                  mouseMode.rightHeld = true;
-                  mouseAction('down', mouseMode.cursorX, mouseMode.cursorY, 2);
-                  updateMouseButtons();
+                  mouseButtonDown(2);
                 }
                 continue;
               }
@@ -1775,13 +1758,9 @@ public final class MainActivity extends Activity {
               mouseMode.touches.delete(touch.identifier);
               const cancelled = type === 'touchcancel';
               if (info.role === 'left') {
-                mouseLeftUp(cancelled);
+                mouseButtonUp(0, cancelled);
               } else if (info.role === 'right') {
-                if (mouseMode.rightHeld) {
-                  mouseMode.rightHeld = false;
-                  mouseAction('up', mouseMode.cursorX, mouseMode.cursorY, 2);
-                  updateMouseButtons();
-                }
+                mouseButtonUp(2, cancelled);
               } else if (info.role === 'cursor'
                   && !cancelled
                   && !info.moved
