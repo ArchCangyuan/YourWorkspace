@@ -816,9 +816,12 @@ final class RdpGateway {
         downstream.start();
         try {
             for (byte[] message = client.readMessage(); message != null; message = client.readMessage()) {
-                trace.fromClient(message);
+                byte[] forward = trace.fromClient(message);
+                if (forward.length == 0) {
+                    continue;
+                }
                 synchronized (writeLock) {
-                    output.write(message);
+                    output.write(forward);
                     output.flush();
                 }
             }

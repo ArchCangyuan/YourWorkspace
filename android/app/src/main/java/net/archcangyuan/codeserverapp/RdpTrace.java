@@ -32,6 +32,7 @@ final class RdpTrace {
     private byte[] clientCapabilities;
     private byte[] clientTempDirectory;
     private int monitorReadyCount;
+    private int earlyDropped;
     private byte[] pendingReplay;
 
     // The virtual channel message being chunked, if any.
@@ -43,7 +44,60 @@ final class RdpTrace {
     private String chunkFlags = "";
 
     /** Records a message the client sends to the server. */
-    synchronized void fromClient(byte[] message) {
+    /**
+     * Records a message the client sends to the server and returns what to
+     * forward: the message itself, or a copy without clipboard PDUs sent
+     * before the server's first Monitor Ready. IronRDP sends its clipboard
+     * handshake early when the phone's clipboard has content at connect, and
+     * again after Monitor Ready; given both, the PC's rdpclip answers once and
+     * then stops answering the clipboard channel altogether.
+     */
+    synchronized byte[] fromClient(byte[] message) {
+        byte[] forward = message;
+        if (pending.length == 0 && monitorReadyCount == 0 && cliprdrChannel >= 0) {
+            forward = withoutEarlyClipboard(message);
+        }
+        record(message);
+        return forward;
+    }
+
+    private byte[] withoutEarlyClipboard(byte[] message) {
+        java.io.ByteArrayOutputStream kept = new java.io.ByteArrayOutputStream(message.length);
+        int offset = 0;
+        boolean dropped = false;
+        while (offset < message.length) {
+            int length = pduLength(message, offset);
+            if (length <= 0 || offset + length > message.length) {
+                kept.write(message, offset, message.length - offset);
+                break;
+            }
+            if ((message[offset] & 0xFF) == 3 && isClipboardPdu(message, offset, length)) {
+                dropped = true;
+                earlyDropped += 1;
+            } else {
+                kept.write(message, offset, length);
+            }
+            offset += length;
+        }
+        if (!dropped) {
+            return message;
+        }
+        clipEvents.addLast(String.format(Locale.US,
+            "%tT.%<tL gateway held back an early clipboard PDU (before the PC's Monitor Ready)",
+            System.currentTimeMillis()));
+        return kept.toByteArray();
+    }
+
+    private boolean isClipboardPdu(byte[] data, int offset, int length) {
+        int mcs = offset + 7;
+        if (length < 14 || (data[mcs] & 0xFF) != 0x64) {
+            return false;
+        }
+        int channel = ((data[mcs + 3] & 0xFF) << 8) | (data[mcs + 4] & 0xFF);
+        return channel == cliprdrChannel;
+    }
+
+    private void record(byte[] message) {
         bytesUp += message.length;
         if (cliprdrIndex < 0) {
             cliprdrIndex = findClientChannel(message, "cliprdr");
