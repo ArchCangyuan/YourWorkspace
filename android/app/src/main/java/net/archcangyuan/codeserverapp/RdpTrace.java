@@ -54,11 +54,117 @@ final class RdpTrace {
      */
     synchronized byte[] fromClient(byte[] message) {
         byte[] forward = message;
-        if (pending.length == 0 && monitorReadyCount == 0 && cliprdrChannel >= 0) {
-            forward = withoutEarlyClipboard(message);
+        if (pending.length == 0 && cliprdrChannel >= 0) {
+            if (monitorReadyCount == 0) {
+                forward = withoutEarlyClipboard(message);
+            } else {
+                forward = withFileContentsFormat(message);
+            }
         }
-        record(message);
+        record(forward);
         return forward;
+    }
+
+    /**
+     * IronRDP announces uploaded files as FileGroupDescriptorW and Preferred
+     * DropEffect only. The PC's rdpclip puts just the listed formats on the
+     * Windows clipboard, and Explorer only offers Paste for a file descriptor
+     * that comes with FileContents (checked on the PC: Paste stayed disabled
+     * with exactly those formats). Adds a FileContents entry to such lists.
+     */
+    private byte[] withFileContentsFormat(byte[] message) {
+        java.io.ByteArrayOutputStream out = null;
+        int offset = 0;
+        int copied = 0;
+        while (offset < message.length) {
+            int length = pduLength(message, offset);
+            if (length <= 0 || offset + length > message.length) {
+                break;
+            }
+            byte[] rewritten = (message[offset] & 0xFF) == 3
+                ? fileListWithFileContents(message, offset, length)
+                : null;
+            if (rewritten != null) {
+                if (out == null) {
+                    out = new java.io.ByteArrayOutputStream(message.length + 64);
+                }
+                out.write(message, copied, offset - copied);
+                out.write(rewritten, 0, rewritten.length);
+                copied = offset + length;
+            }
+            offset += length;
+        }
+        if (out == null) {
+            return message;
+        }
+        out.write(message, copied, message.length - copied);
+        clipEvents.addLast(String.format(Locale.US,
+            "%tT.%<tL gateway added FileContents to the file list", System.currentTimeMillis()));
+        return out.toByteArray();
+    }
+
+    private static final int FILE_CONTENTS_FORMAT_ID = 0xC0FC;
+
+    private byte[] fileListWithFileContents(byte[] data, int offset, int length) {
+        int end = offset + length;
+        int mcs = offset + 7;
+        if (length < 16 || (data[mcs] & 0xFF) != 0x64) {
+            return null;
+        }
+        int channel = ((data[mcs + 3] & 0xFF) << 8) | (data[mcs + 4] & 0xFF);
+        boolean longLength = ((data[mcs + 6] & 0xFF) & 0x80) != 0;
+        int userData = mcs + 7 + (longLength ? 1 : 0);
+        if (channel != cliprdrChannel || userData + 16 > end) {
+            return null;
+        }
+        long chunkFlags = le32(data, userData + 4);
+        int body = userData + 8;
+        int type = (data[body] & 0xFF) | ((data[body + 1] & 0xFF) << 8);
+        if ((chunkFlags & 0x3) != 0x3 || type != 2) {
+            return null;
+        }
+        String formats = formatNames(data, body + 8, end);
+        if (!formats.contains("FileGroupDescriptorW") || formats.contains("FileContents")) {
+            return null;
+        }
+        byte[] entry = new byte[4 + ("FileContents".length() + 1) * 2];
+        entry[0] = (byte) FILE_CONTENTS_FORMAT_ID;
+        entry[1] = (byte) (FILE_CONTENTS_FORMAT_ID >>> 8);
+        String name = "FileContents";
+        for (int index = 0; index < name.length(); index++) {
+            entry[4 + index * 2] = (byte) name.charAt(index);
+        }
+        int oldUserLength = end - userData;
+        int newUserLength = oldUserLength + entry.length;
+        if (newUserLength - 8 > 1600 || newUserLength > 0x3FFF) {
+            return null;
+        }
+        java.io.ByteArrayOutputStream pdu = new java.io.ByteArrayOutputStream(length + entry.length + 1);
+        // MCS Send Data Request header up to (not including) the PER length.
+        byte[] head = java.util.Arrays.copyOfRange(data, offset + 4, mcs + 6);
+        byte[] user = java.util.Arrays.copyOfRange(data, userData, end);
+        writeLe32(user, 0, le32(user, 0) + entry.length);
+        writeLe32(user, 12, le32(user, 12) + entry.length);
+        byte[] perLength = newUserLength < 0x80
+            ? new byte[] { (byte) newUserLength }
+            : new byte[] { (byte) (0x80 | (newUserLength >>> 8)), (byte) newUserLength };
+        int tpktLength = 4 + head.length + perLength.length + newUserLength;
+        pdu.write(3);
+        pdu.write(0);
+        pdu.write(tpktLength >>> 8);
+        pdu.write(tpktLength & 0xFF);
+        pdu.write(head, 0, head.length);
+        pdu.write(perLength, 0, perLength.length);
+        pdu.write(user, 0, user.length);
+        pdu.write(entry, 0, entry.length);
+        return pdu.toByteArray();
+    }
+
+    private static void writeLe32(byte[] data, int offset, long value) {
+        data[offset] = (byte) value;
+        data[offset + 1] = (byte) (value >>> 8);
+        data[offset + 2] = (byte) (value >>> 16);
+        data[offset + 3] = (byte) (value >>> 24);
     }
 
     private byte[] withoutEarlyClipboard(byte[] message) {
