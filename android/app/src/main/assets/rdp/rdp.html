@@ -504,6 +504,16 @@
     }
     const delay = Math.min(10000, 1000 * attempts);
     showStatus(`Reconnecting… (${attempts}/5)`, shortReason(reason));
+    // The gateway notes which side closed the connection a moment later.
+    const shownAttempt = attempts;
+    window.setTimeout(() => {
+      const relayEnd = gatewayStatus().relayEnd;
+      if (!relayEnd) return;
+      console.warn('gateway: connection ended:', relayEnd);
+      if (!connected && attempts === shownAttempt) {
+        showStatus(`Reconnecting… (${attempts}/5)`, `${shortReason(reason)} · ${relayEnd}`);
+      }
+    }, 400);
     notifyNative('reconnecting', reason);
     setTimeout(connect, delay);
   };

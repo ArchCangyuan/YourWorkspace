@@ -36,6 +36,7 @@ final class AccessWebSocket implements AutoCloseable {
 
     private static final String WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     private static final int CONNECT_TIMEOUT_MS = 15_000;
+    private volatile String closeReason = "";
     private static final int OPCODE_CONTINUATION = 0x0;
     private static final int OPCODE_TEXT = 0x1;
     private static final int OPCODE_BINARY = 0x2;
@@ -348,6 +349,12 @@ final class AccessWebSocket implements AutoCloseable {
             case OPCODE_PONG:
                 continue;
             case OPCODE_CLOSE:
+                closeReason = payload.length >= 2
+                    ? "close " + (((payload[0] & 0xFF) << 8) | (payload[1] & 0xFF))
+                        + (payload.length > 2
+                            ? " " + new String(payload, 2, payload.length - 2, StandardCharsets.UTF_8)
+                            : "")
+                    : "close";
                 return null;
             case OPCODE_TEXT:
             case OPCODE_BINARY:
@@ -391,6 +398,18 @@ final class AccessWebSocket implements AutoCloseable {
     /** Sets a read timeout in milliseconds for {@link #readMessage()}; 0 waits forever. */
     void setReadTimeout(int millis) throws IOException {
         socket.setSoTimeout(millis);
+    }
+
+    /** How the other side closed: its close code and reason, if it sent one. */
+    String closeReason() {
+        return closeReason;
+    }
+
+    /** Records why reading from this WebSocket stopped, unless a close frame said so. */
+    void noteClose(String reason) {
+        if (closeReason.isEmpty()) {
+            closeReason = reason;
+        }
     }
 
     boolean isClosed() {

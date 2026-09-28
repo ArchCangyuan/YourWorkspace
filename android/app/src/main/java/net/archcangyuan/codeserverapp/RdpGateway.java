@@ -74,6 +74,8 @@ final class RdpGateway {
     private final Map<String, String> sessionHosts = new ConcurrentHashMap<>();
     private final Map<String, String> sessionStages = new ConcurrentHashMap<>();
     private final Map<String, String> sessionErrors = new ConcurrentHashMap<>();
+    /** Why the last relay of a session ended (which side, and any error). */
+    private final Map<String, String> sessionRelayEnds = new ConcurrentHashMap<>();
     private final java.util.Set<String> rsaKeyExchangeHosts = ConcurrentHashMap.newKeySet();
     private final SecureRandom random = new SecureRandom();
     // Cloudflare closes idle WebSockets after about 100 s; an idle or
@@ -199,6 +201,7 @@ final class RdpGateway {
         try {
             status.put("stage", sessionStages.getOrDefault(sessionToken, ""));
             status.put("error", sessionErrors.getOrDefault(sessionToken, ""));
+            status.put("relayEnd", sessionRelayEnds.getOrDefault(sessionToken, ""));
         } catch (org.json.JSONException ignored) {
             // Fields are plain strings.
         }
@@ -547,7 +550,12 @@ final class RdpGateway {
             sendPdu(client, RdCleanPath.encodeResponse(host + ":" + TLS_PORT, link.x224Response, chain));
 
             setStage(sessionToken, "relay");
-            relay(client, link.tls);
+            String ended = relay(client, link.tls);
+            String tunnelClose = link.tunnel.closeReason();
+            sessionRelayEnds.put(
+                sessionToken,
+                ended + (tunnelClose.isEmpty() ? "" : " (Cloudflare tunnel: " + tunnelClose + ")")
+            );
         } catch (ReportedException exception) {
             // The client already has the error.
         } catch (Exception exception) {
@@ -728,8 +736,9 @@ final class RdpGateway {
                     output.write(buffer, 0, count);
                     output.flush();
                 }
-            } catch (IOException ignored) {
-                // Closed.
+                tunnel.noteClose("ended without a close frame");
+            } catch (IOException exception) {
+                tunnel.noteClose("read failed: " + describe(exception));
             } finally {
                 closeQuietly(socket);
             }
@@ -742,8 +751,8 @@ final class RdpGateway {
                         tunnel.sendBinary(buffer, 0, count);
                     }
                 }
-            } catch (IOException ignored) {
-                // Closed.
+            } catch (IOException exception) {
+                tunnel.noteClose("write failed: " + describe(exception));
             } finally {
                 tunnel.close();
             }
@@ -754,8 +763,13 @@ final class RdpGateway {
         up.start();
     }
 
-    /** Relays client WebSocket messages to the TLS stream and back until either side closes. */
-    private static void relay(AccessWebSocket client, SSLSocket tls) throws IOException {
+    /**
+     * Relays client WebSocket messages to the TLS stream and back until either
+     * side closes. Returns which side ended first and why.
+     */
+    private static String relay(AccessWebSocket client, SSLSocket tls) {
+        java.util.concurrent.atomic.AtomicReference<String> ended =
+            new java.util.concurrent.atomic.AtomicReference<>();
         Thread downstream = new Thread(() -> {
             byte[] buffer = new byte[32 * 1024];
             try (InputStream input = tls.getInputStream()) {
@@ -764,19 +778,27 @@ final class RdpGateway {
                         client.sendBinary(buffer, 0, count);
                     }
                 }
-            } catch (IOException ignored) {
-                // Closed.
+                ended.compareAndSet(null, "server closed the connection");
+            } catch (IOException exception) {
+                ended.compareAndSet(null, "server side: " + describe(exception));
             } finally {
                 client.close();
             }
         }, "RdpGateway-relay-down");
         downstream.setDaemon(true);
         downstream.start();
-        OutputStream output = tls.getOutputStream();
-        for (byte[] message = client.readMessage(); message != null; message = client.readMessage()) {
-            output.write(message);
-            output.flush();
+        try {
+            OutputStream output = tls.getOutputStream();
+            for (byte[] message = client.readMessage(); message != null; message = client.readMessage()) {
+                output.write(message);
+                output.flush();
+            }
+            ended.compareAndSet(null, "app closed the connection");
+        } catch (IOException exception) {
+            ended.compareAndSet(null, "app side: " + describe(exception));
         }
+        String reason = ended.get();
+        return reason == null ? "" : reason;
     }
 
     private static SSLContext trustAllContext() throws Exception {
